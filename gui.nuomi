@@ -1,0 +1,198 @@
+;; gui.nuomi - Nuomi 启动器图形界面
+;; 由 nuomi.cmd 的 MC-gui / 桌面 NuomiMC-GUI.bat 触发；cwd 应为 launcher 目录
+;; 依赖窗口原语: window-create/fill/shape/text/clear/invalidate/close/event/click/char
+;;
+;; 说明: GUI 只负责「选 + 点 + 输名字 + 选目录」, 真正的下载/启动交给 launcher.nuomi(CLI 模式),
+;;       通过 cmd /c start 异步拉起, 避免阻塞 GUI 消息泵。进度经 NUOMI_PROGRESS_FILE 回传轮询。
+
+;; 语法自检开关
+(define IS_TEST (not (null? (getenv "NUOMI_GUI_TEST"))))
+
+;; ---------- 配色 ----------
+(define WIN_W 480)
+(define WIN_H 440)
+(define (rgb r g b) (+ (* r 65536) (* g 256) b))
+(define BG      (rgb 20 22 26))
+(define PANEL   (rgb 30 33 40))
+(define ACCENT  (rgb 76 154 255))
+(define BTN     (rgb 58 123 213))
+(define BTN_DIS (rgb 44 49 58))
+(define TEXT    (rgb 230 230 230))
+(define DIM     (rgb 138 143 152))
+(define GREEN   (rgb 87 199 94))
+(define WHITE   (rgb 255 255 255))
+(define CARD    (rgb 26 29 35))
+(define SEPLINE (rgb 40 44 52))
+(define LOGO    (rgb 124 92 255))
+
+;; ---------- 几何 ----------
+;; 玩家名
+(define NAME_X 40) (define NAME_Y 82) (define NAME_W 400) (define NAME_H 32)
+;; 游戏目录
+(define PATH_X 40) (define PATH_Y 144) (define PATH_W 400) (define PATH_H 32)
+;; 按钮
+(define BTN_W 180) (define BTN_H 46) (define B1X 40) (define B2X 260) (define BTN_Y 206)
+;; 状态卡
+(define CARD_X 24) (define CARD_Y 280) (define CARD_W 432) (define CARD_H 72)
+(define STATUS_X 40) (define STATUS_Y 300)
+;; 进度条
+(define BAR_X 40) (define BAR_Y 384) (define BAR_W 400) (define BAR_H 16)
+
+;; ---------- 状态 ----------
+(define USERNAME (let ((u (getenv "NUOMI_USERNAME")))
+                   (if (or (null? u) (equal? u "")) "Tracgiture" u)))
+(define GAME_DIR (let ((d (getenv "NUOMI_GAME_DIR")))
+                   (if (or (null? d) (equal? d "")) (str (getenv "USERPROFILE") "/.nuomi-mc") d)))
+(define VERSION "1.21.4")
+(define status-msg "点按钮开始 · 需再点一次确认")
+(define pstage "") (define pcur 0) (define ptotal 0) (define busy false)
+(define focus "name")        ;; "name" | "path" | ""
+(define pending "")          ;; "" | "launch" | "download"
+(define done false)
+(define frame 0)
+(define PROG (str (getenv "USERPROFILE") "/.nuomi-mc/gui_progress.txt"))
+(define LAUNCH_DIR (let ((d (getenv "NUOMI_LAUNCHER_DIR")))
+                     (if (or (null? d) (equal? d "")) "." d)))
+
+;; ---------- 命中测试 ----------
+(define (in-rect x y rx ry rw rh)
+  (and (>= x rx) (<= x (+ rx rw)) (>= y ry) (<= y (+ ry rh))))
+
+;; ---------- 绘图 ----------
+(define (draw ui)
+  (window-clear ui)
+  (window-fill ui 0 0 WIN_W WIN_H BG)
+  ;; 标题栏
+  (window-fill ui 0 0 WIN_W 52 PANEL)
+  (window-shape ui 6 16 14 26 26 LOGO)
+  (window-text ui 23 17 2 "N" WHITE)
+  (window-text ui 54 16 2 "Nuomi MC Launcher" WHITE)
+  (window-text ui 352 22 1 (str "v" VERSION) DIM)
+  ;; 标题栏底分隔线
+  (window-shape ui 1 0 52 WIN_W 1 SEPLINE)
+  ;; 玩家名
+  (window-text ui NAME_X 66 1 "玩家名" DIM)
+  (window-shape ui 6 NAME_X NAME_Y NAME_W NAME_H (if (equal? focus "name") ACCENT BTN_DIS))
+  (window-fill ui (+ NAME_X 4) (+ NAME_Y 4) (- NAME_W 8) (- NAME_H 8) (rgb 16 18 22))
+  (if (equal? USERNAME "")
+      (window-text ui (+ NAME_X 10) (+ NAME_Y 9) 1 "输入玩家名…" DIM)
+      (window-text ui (+ NAME_X 10) (+ NAME_Y 9) 1 USERNAME TEXT))
+  ;; 玩家名光标(闪烁)
+  (if (and (equal? focus "name") (< (% frame 40) 20) (not busy))
+      (window-shape ui 1 (+ NAME_X 10 (* (length USERNAME) 8)) (+ NAME_Y 6) 2 (- NAME_H 12) TEXT)
+      0)
+  ;; 游戏目录
+  (window-text ui PATH_X 128 1 "游戏目录" DIM)
+  (window-shape ui 6 PATH_X PATH_Y PATH_W PATH_H (if (equal? focus "path") ACCENT BTN_DIS))
+  (window-fill ui (+ PATH_X 4) (+ PATH_Y 4) (- PATH_W 8) (- PATH_H 8) (rgb 16 18 22))
+  (if (equal? GAME_DIR "")
+      (window-text ui (+ PATH_X 10) (+ PATH_Y 9) 1 "输入游戏目录…" DIM)
+      (window-text ui (+ PATH_X 10) (+ PATH_Y 9) 1 GAME_DIR TEXT))
+  ;; 目录光标(闪烁)
+  (if (and (equal? focus "path") (< (% frame 40) 20) (not busy))
+      (window-shape ui 1 (+ PATH_X 10 (* (length GAME_DIR) 7)) (+ PATH_Y 6) 2 (- PATH_H 12) TEXT)
+      0)
+  ;; 按钮(待确认时高亮 + 改文字)
+  (window-fill ui B1X BTN_Y BTN_W BTN_H (if busy BTN_DIS (if (equal? pending "launch") ACCENT BTN)))
+  (window-text ui (+ B1X 55) (+ BTN_Y 15) 1 (if (equal? pending "launch") "确认启动?" "启动游戏") WHITE)
+  (window-fill ui B2X BTN_Y BTN_W BTN_H (if busy BTN_DIS (if (equal? pending "download") ACCENT BTN)))
+  (window-text ui (+ B2X 65) (+ BTN_Y 15) 1 (if (equal? pending "download") "确认下载?" "下载资源") WHITE)
+  ;; 状态卡
+  (window-shape ui 6 CARD_X CARD_Y CARD_W CARD_H CARD)
+  (window-text ui STATUS_X STATUS_Y 1 status-msg TEXT)
+  ;; 进度条
+  (window-shape ui 6 BAR_X BAR_Y BAR_W BAR_H BTN_DIS)
+  (if (> ptotal 0)
+      (let ((pw (floor (/ (* BAR_W pcur) ptotal))))
+        (window-fill ui BAR_X BAR_Y pw BAR_H GREEN)
+        (window-text ui (+ BAR_X 6) (+ BAR_Y 1) 1 (str pstage "  " pcur "/" ptotal) WHITE))
+      0)
+  ;; 底部提示
+  (window-text ui 40 414 1 "Esc 退出 · 点输入框编辑 · 按钮需点两次确认" DIM)
+  (window-invalidate ui))
+
+;; ---------- 触发后台任务 ----------
+(define (spawn mode)
+  (set! busy true)
+  (set! pending "")
+  (set! status-msg (str "已在后台启动「" mode "」，请稍候…"))
+  (set! pstage mode) (set! pcur 0) (set! ptotal 0)
+  (write-file PROG (str mode "|0|0"))
+  (proc-run "cmd" (list "/c"
+    (str "set NUOMI_MODE=" mode
+         "&& set NUOMI_USERNAME=" USERNAME
+         "&& set NUOMI_GAME_DIR=" GAME_DIR
+         "&& set NUOMI_PROGRESS_FILE=" PROG
+         "&& cd /d " LAUNCH_DIR
+         "&& start /min " LAUNCH_DIR "\\nuomi.exe launcher.nuomi"))))
+
+;; ---------- 读进度 ----------
+(define (poll)
+  (if (not (exists? PROG)) 0
+    (let ((line (read-file PROG)))
+      (if (or (null? line) (equal? line "")) 0
+        (let ((parts (str-split line "|")))
+          (if (< (length parts) 3) 0
+            (begin
+              (set! pstage (get parts 0))
+              (set! pcur (to-number (get parts 1)))
+              (set! ptotal (to-number (get parts 2)))
+              0)))))))
+
+;; ---------- 主循环 ----------
+(define (gui-loop ui)
+  (define cl nil) (define ch nil) (define ev nil)
+  (while (not done)
+    (set! cl (window-click))
+    (set! ch (window-char))
+    (set! ev (window-event))
+    ;; 鼠标点击(二次确认)
+    (if (not (null? cl))
+        (let ((cx (floor (/ cl 100000))) (cy (% cl 100000)))
+          (if (in-rect cx cy B1X BTN_Y BTN_W BTN_H)
+              (if (equal? pending "launch") (spawn "launch") (if (not busy) (set! pending "launch") 0))
+              (if (in-rect cx cy B2X BTN_Y BTN_W BTN_H)
+                  (if (equal? pending "download") (spawn "download") (if (not busy) (set! pending "download") 0))
+                  (if (in-rect cx cy NAME_X NAME_Y NAME_W NAME_H)
+                      (begin (set! focus "name") (set! pending ""))
+                      (if (in-rect cx cy PATH_X PATH_Y PATH_W PATH_H)
+                          (begin (set! focus "path") (set! pending ""))
+                          (set! pending "")))))
+        0)
+    ;; 字符输入(仅对应焦点框, 且未在下载)
+    (if (and (not (null? ch)) (not busy))
+        (if (equal? focus "name")
+            (if (< (length USERNAME) 16) (set! USERNAME (str USERNAME ch)) 0)
+            (if (equal? focus "path")
+                (if (< (length GAME_DIR) 120) (set! GAME_DIR (str GAME_DIR ch)) 0)
+                0))
+        0)
+    ;; 退格
+    (if (and (equal? ev "back") (not busy))
+        (if (equal? focus "name")
+            (if (> (length USERNAME) 0) (set! USERNAME (substring USERNAME 0 (- (length USERNAME) 1))) 0)
+            (if (equal? focus "path")
+                (if (> (length GAME_DIR) 0) (set! GAME_DIR (substring GAME_DIR 0 (- (length GAME_DIR) 1))) 0)
+                0))
+        0)
+    ;; 退出
+    (if (equal? ev "esc") (begin (window-close ui) (set! done true)) 0)
+    (if (equal? ev "close") (set! done true) 0)
+    ;; 轮询后台进度
+    (if busy (poll) 0)
+    ;; 重绘
+    (if (not done) (draw ui) 0)
+    ;; 帧计数(光标闪烁用) + 节流
+    (set! frame (+ frame 1))
+    (sleep 16)))
+
+;; ---------- 入口 ----------
+(define (gui-main)
+  (define ui (window-create 200 150 WIN_W WIN_H "Nuomi 启动器"))
+  (if (null? ui)
+      (println "GUI: 窗口创建失败 (可能在无桌面/无 GUI 环境)")
+      (begin (draw ui) (gui-loop ui) (println "GUI 已退出"))))
+
+(if IS_TEST
+    (println "gui.nuomi 语法自检通过")
+    (gui-main))

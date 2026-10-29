@@ -1,0 +1,711 @@
+;; ============================================================
+;;  Nuomi 启动器 (nuomi-launcher)  ·  离线优先的 Minecraft 启动器
+;;  语言: 糯米语言 (Nuomi) v0.3  ·  运行时: nuomi.exe
+;;
+;;  用法:
+;;    nuomi.exe launcher.nuomi
+;;
+;;  配置区见下方 CONFIG。常用改法:
+;;    · 想实际下载并启动  -> 把 DRY_RUN 改成 false, LAUNCH? 改成 true
+;;    · 只想验证下载管道  ->  DRY_RUN=false, LAUNCH?=false
+;;    · 不要资源包(无贴图) ->  DOWNLOAD_ASSETS=false
+;;    · 换版本/换玩家名   ->  改 TARGET_VERSION / USERNAME
+;;
+;;  说明: 启动器只走官方 Piston API 下载, 不打包任何游戏文件。
+;;        26.2 是社区服版本号, Piston 官方没有该版本, 默认用 1.21.4 做管线验证。
+;; ============================================================
+
+;; ---------------- CONFIG ----------------
+(define UA "NuomiLauncher/0.1")
+(define DRY_RUN true)            ; true=只规划不下载/不启动
+(define LAUNCH? true)             ; 下载完成后是否真正启动 java
+;; 运行模式(可用环境变量 NUOMI_MODE 临时覆盖上面的默认值):
+;;   dry      -> 只规划, 打印启动命令, 不下载也不启动
+;;   download -> 下载全部资源, 不启动
+;;   launch   -> 下载全部资源并启动
+;;   不设/其它 -> 照 CONFIG 里的 DRY_RUN / LAUNCH? 走
+(define MODE (getenv "NUOMI_MODE"))
+(define TARGET_VERSION "1.21.4")  ; Piston 上真实存在的版本
+(define USERNAME "Tracgiture")    ; 离线玩家名 (默认用你的正版角色)
+(define RAM_MB 2048)
+(define JAVA_CMD "java")          ; 可改成 java.exe 绝对路径
+(define OS "windows")             ; windows / linux / osx
+(define ARCH "x86_64")            ; 用于规则匹配(32位 x86 规则不会被选中)
+(define DOWNLOAD_ASSETS true)     ; 是否下载资源包(贴图/音效)
+(define USE_CURL_PARALLEL true)   ; 资源包是否用 curl --parallel 批量下载(Windows 自带 curl.exe, 比串行快很多)
+(define PARALLEL_MAX 24)          ; 并发数; 网络好可上 50, 慢网调到 8~16
+(define PATH_SEP (if (equal? OS "windows") ";" ":"))  ; classpath 分隔符: Windows ";", 其它 ":"
+(define SEP "/")
+(define LAUNCHER_NAME "NuomiLauncher")
+(define LAUNCHER_VERSION "0.1")
+;; ---------------- 常量 ----------------
+(define PISTON_MANIFEST "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json")
+;; 依赖库默认 CDN(元数据里每个条目其实都自带 url, 优先用元数据的)
+(define LIB_BASE "https://libraries.minecraft.net/")
+;; 资源对象 CDN
+(define ASSET_BASE "https://resources.download.minecraft.net/")
+
+;; ---------------- 运行态全局(由 run 填充) ----------------
+;; 主目录: Windows 取 USERPROFILE, 其它平台取 HOME; 都取不到就退回当前工作目录。
+;; ⚠️ 注意: (home) 是「光标复位 + 隐藏光标」的终端指令, 不是主目录查询, 千万别用!
+(define HOME-RAW (if (equal? OS "windows") (getenv "USERPROFILE") (getenv "HOME")))
+(define HOME (if (string? HOME-RAW) (str-replace HOME-RAW "\\" "/") "."))
+(define BASE_DIR (let ((d (getenv "NUOMI_GAME_DIR")))
+                   (if (or (null? d) (equal? d "")) (str HOME "/.nuomi-mc") d)))
+(define NATIVES_DIR "")
+(define CLASSPATH "")
+(define UUID "")
+(define TOKEN "")
+(define INSTANCE_DIR "")
+(define ASSETS_DIR "")
+(define ASSET_ID "")
+(define CLIENT_ID "")
+(define XUID "")
+(define MAIN_CLASS "net.minecraft.client.main.Main")
+
+;; 资源包下载相关的运行态(全局, 供资源下载函数共享)
+(define asset-objs nil)           ; 资源索引对象(含 "objects" 键)
+(define asset-count 0)            ; 资源对象总数
+(define afailed 0)                ; 资源下载/校验失败计数
+(define asset-fails '())          ; 校验失败的对象 hash 列表(用于重试)
+
+;; ============================================================
+;;  基础工具
+;; ============================================================
+
+;; 干净打印(println 会给字符串加引号, 这里用 draw 原样输出)
+(define (say x) (draw (str x)) (draw "\n"))
+
+;; 在 str 中找 ch 最后一次出现的位置, 找不到返回 -1
+(define (last-index-of str ch)
+  (define pos -1)
+  (define start 0)
+  (define found (string-search str ch start))
+  (while (>= found 0)
+    (set! pos found)
+    (set! start (+ found 1))
+    (set! found (string-search str ch start)))
+  pos)
+
+;; 逐级创建目录(路径用 / 分隔)
+(define (mkdirs path)
+  (define parts (str-split path SEP))
+  (define cur "")
+  (define i 0)
+  (define part "")
+  (while (< i (length parts))
+    (set! part (get parts i))
+    (if (= i 0)
+        (set! cur part)
+        (set! cur (str cur SEP part)))
+    (if (and (> i 0) (not (exists? cur))) (mkdir cur) 0)
+    (set! i (+ i 1)))
+  cur)
+
+;; 确保某文件的父目录存在
+(define (ensure-parent path)
+  (define p (last-index-of path SEP))
+  (if (> p 0) (mkdirs (substring path 0 p)) 0))
+
+;; 缩短过长路径用于显示
+(define (short s)
+  (if (> (length s) 80)
+      (str "..." (substring s (- (length s) 77) (length s)))
+      s))
+
+;; 把 "group:artifact:version" 变成 maven 本地路径
+(define (maven-path name)
+  (define first (string-search name ":"))
+  (define last (last-index-of name ":"))
+  (define group (substring name 0 first))
+  (define artifact (substring name (+ first 1) last))
+  (define version (substring name (+ last 1) (length name)))
+  (str (str-replace group "." "/") SEP artifact SEP version SEP artifact "-" version ".jar"))
+
+;; 用 sep 连接字符串列表
+(define (str-join lst sep)
+  (if (null? lst) ""
+    (if (null? (cdr lst)) (car lst)
+      (str (car lst) sep (str-join (cdr lst) sep)))))
+
+;; 字符串是否以 suffix 结尾
+(define (ends-with? s suffix)
+  (define ls (length s))
+  (define lx (length suffix))
+  (if (> lx ls) false
+      (equal? (substring s (- ls lx) ls) suffix)))
+
+;; 字符串是否包含 sub
+(define (contains? s sub)
+  (>= (string-search s sub 0) 0))
+
+;; ============================================================
+;;  规则(rules)与平台判定
+;;
+;;  Mojang 的 rules 语义(官方启动器行为):
+;;    · 规则里的 os 段与本机不匹配 -> 该规则「不适用」
+;;    · 在适用规则里, 最后一条的 action 决定去留(allow=要, disallow=不要)
+;;    · rules 列表非空但一条都不适用 -> 排除
+;;    · 没有 rules -> 包含
+;;  另: 1.19 起原生库靠 name 里的 classifier 区分平台/架构
+;;      (natives-windows / natives-windows-x86 / natives-windows-arm64),
+;;      rules 里区分不出来, 得单独看 classifier 后缀。
+;; ============================================================
+
+;; 配置里的 OS 名换算成 classifier 里用的平台词(osx -> macos)
+(define (os-token) (if (equal? OS "osx") "macos" OS))
+
+;; 规则是否适用
+;;   · 带 features 条件的规则我们不支持(离线模式没有特性开关) -> 不适用
+;;     这一条很关键: 1.21.4 的 arguments.game 里 --demo / --quickPlay* 全都
+;;     挂在 features 规则上, 不处理的话会把这些参数连同 ${quickPlayPath}
+;;     这类占位符一起塞进启动命令。
+;;   · os.name / os.arch 必须匹配本机; os.version 无法判定, 忽略
+(define (rule-applicable? rule)
+  (define os (json-get rule "os"))
+  (define features (json-get rule "features"))
+  (define oname (json-get os "name"))
+  (define oarch (json-get os "arch"))
+  (if (not (null? features)) false
+    (and (or (null? oname) (equal? oname OS))
+         (or (null? oarch) (equal? oarch ARCH)))))
+
+;; 通用规则判定: rules 决定是否纳入
+(define (rules-decide rules)
+  (define n 0)
+  (define i 0)
+  (define app-count 0)
+  (define last-allow false)
+  (if (null? rules) true
+    (begin
+      (set! n (length rules))
+      (while (< i n)
+        (let ((rule (get rules i)))
+          (if (rule-applicable? rule)
+              (begin
+                (set! app-count (+ app-count 1))
+                (set! last-allow (equal? (json-get rule "action") "allow")))
+              0))
+        (set! i (+ i 1)))
+      (if (= app-count 0) false last-allow))))
+
+;; "group:artifact:version[:classifier]" 里取 classifier, 没有返回 nil
+(define (name-classifier name)
+  (define parts (str-split name ":"))
+  (if (>= (length parts) 4) (get parts 3) nil))
+
+;; classifier 里的平台词(windows/linux/macos), 判断不出返回 nil
+(define (classifier-os cls)
+  (if (contains? cls "windows") "windows"
+    (if (contains? cls "linux") "linux"
+      (if (contains? cls "macos") "macos" nil))))
+
+;; classifier 里的架构(x86_64/arm64/x86), 判断不出返回 nil
+(define (classifier-arch cls)
+  (if (ends-with? cls "-x86_64") "x86_64"
+    (if (or (ends-with? cls "-arm64") (ends-with? cls "-aarch_64")) "arm64"
+      (if (ends-with? cls "-x86") "x86" nil))))
+
+;; ============================================================
+;;  下载 + SHA1 校验
+;; ============================================================
+
+;; 下载一个文件并校验 sha1
+;;   · 目标已存在且 sha1 匹配 -> 跳过(返回 0)
+;;   · 下载成功且 sha1 匹配   -> 返回字节数
+;;   · 失败                   -> 返回 -1
+(define (download-verify url dest sha1)
+  (ensure-parent dest)
+  (define need-dl true)
+  (if (exists? dest)
+      (if (null? sha1)
+          (set! need-dl false)
+          (if (equal? (sha1-file dest) sha1)
+              (set! need-dl false)
+              (set! need-dl true)))
+      (set! need-dl true))
+  (define n -1)
+  (if (not need-dl) 0
+    (begin
+      (set! n (http-download url dest UA))
+      ;; http-download 失败时可能返回 -1 或 nil, 两种都要当失败处理
+      (if (or (null? n) (= n -1))
+          (begin (say (str "  ✘ 下载失败: " (short url))) -1)
+          (if (null? sha1) n
+            (if (equal? (sha1-file dest) sha1) n
+              (begin (say (str "  ✘ SHA1 不匹配: " (short dest))) -1)))))))
+
+;; 进度文件(供 GUI 前端轮询显示); 未设置 NUOMI_PROGRESS_FILE 时为空, 下列函数自动跳过
+(define PROGRESS_FILE (getenv "NUOMI_PROGRESS_FILE"))
+(define (write-progress stage cur total)
+  (if (and (not (null? PROGRESS_FILE)) (not (equal? PROGRESS_FILE "")))
+      (write-file PROGRESS_FILE (str stage "|" cur "|" total))
+      0))
+
+;; 下载一批依赖条目(带进度), 返回失败个数
+;; 条目格式: [kind, 相对路径, URL, sha1]
+(define (download-descs descs kind)
+  (define total 0)
+  (define i 0)
+  (define failed 0)
+  (set! total (length descs))
+  (say (str "» 下载" kind " (" total " 个)..."))
+  (while (< i total)
+    (let* ((d (get descs i))
+           (dest (str BASE_DIR SEP (get d 1)))
+           (r (download-verify (get d 2) dest (get d 3))))
+      (if (= r -1) (set! failed (+ failed 1)) 0))
+    (if (= (% (+ i 1) 10) 0)
+        (begin (say (str "  " kind " 进度 " (+ i 1) "/" total))
+               (write-progress "lib" (+ i 1) total))
+        0)
+    (set! i (+ i 1)))
+  failed)
+
+;; ============================================================
+;;  资源包下载(curl 并行通道)
+;;
+;;  资源对象有 4039 个, 串行 http-download ~1 个/秒 → 全量 ~1 小时。
+;;  提速方案: 用 Windows 自带的 curl.exe --parallel 批量下载, 再逐个 SHA1 校验。
+;;  Nuomi 原生串行仍保留为兜底(USE_CURL_PARALLEL=false 时走)。
+;; ============================================================
+
+;; 单个资源对象的 curl -K 配置行(url + output 两行)
+(define (asset-entry-cfg h)
+  (str "url = \"" ASSET_BASE (substring h 0 2) SEP h "\"\n"
+       "output = \"" ASSETS_DIR SEP "objects" SEP (substring h 0 2) SEP h "\"\n"))
+
+;; 遍历全部资源对象, 分批写 curl -K 清单(避免一次性拼出巨型字符串)
+(define (build-asset-cfg cfg-path)
+  (write-file cfg-path "")
+  (define buf "") (define cnt 0) (define o (json-get asset-objs "objects")) (define e nil) (define h nil)
+  (while (not (null? o))
+    (set! e (car o))
+    (set! h (json-get (cdr e) "hash"))
+    (set! buf (str buf (asset-entry-cfg h)))
+    (set! cnt (+ cnt 1))
+    (if (= cnt 256)
+        (begin (append-file cfg-path buf) (set! buf "") (set! cnt 0))
+        0)
+    (set! o (cdr o)))
+  (if (> cnt 0) (append-file cfg-path buf) 0)
+  cnt)
+
+;; 逐个 SHA1 校验, 失败/缺失的 hash 收集到全局 asset-fails
+(define (verify-assets)
+  (define o (json-get asset-objs "objects")) (define e nil) (define h nil) (define dest nil) (define vi 0)
+  (set! afailed 0)
+  (while (not (null? o))
+    (set! e (car o))
+    (set! h (json-get (cdr e) "hash"))
+    (set! dest (str ASSETS_DIR SEP "objects" SEP (substring h 0 2) SEP h))
+    (if (and (exists? dest) (equal? (sha1-file dest) h))
+        0
+        (begin (set! afailed (+ afailed 1)) (set! asset-fails (cons h asset-fails))))
+    (set! vi (+ vi 1))
+    (if (= (% vi 50) 0) (write-progress "asset" vi asset-count) 0)
+    (set! o (cdr o)))
+  afailed)
+
+;; 重试失败项: 重新生成小清单再 curl 一次(并行小并发)
+(define (retry-failed)
+  (if (null? asset-fails) 0
+    (begin
+      (define cfg (str BASE_DIR SEP "assets_retry.cfg"))
+      (write-file cfg "")
+      (define buf "") (define cnt 0) (define h nil) (define i 0)
+      (while (< i (length asset-fails))
+        (set! h (get asset-fails i))
+        (set! buf (str buf (asset-entry-cfg h)))
+        (set! cnt (+ cnt 1))
+        (if (= cnt 256) (begin (append-file cfg buf) (set! buf "") (set! cnt 0)) 0)
+        (set! i (+ i 1)))
+      (if (> cnt 0) (append-file cfg buf) 0)
+      (say (str "  ↻ 重试失败项 (" (length asset-fails) " 个)..."))
+      (proc-run "curl" (list "-s" "-S" "-Z" "--parallel-max" "8" "--create-dirs" "-K" cfg))
+      (define still 0) (define j 0) (define dest nil)
+      (while (< j (length asset-fails))
+        (set! h (get asset-fails j))
+        (set! dest (str ASSETS_DIR SEP "objects" SEP (substring h 0 2) SEP h))
+        (if (and (exists? dest) (equal? (sha1-file dest) h)) 0
+            (set! still (+ still 1)))
+        (set! j (+ j 1)))
+      (say (str "    重试后仍有 " still " 个失败(可稍后重跑自动续传)")))))
+
+;; 并行通道: 生成清单 → curl 批量下 → 校验 → 重试失败项
+(define (download-assets-parallel)
+  (define cfg (str BASE_DIR SEP "assets_par.cfg"))
+  (say (str "  生成 curl 清单 (" asset-count " 个)..."))
+  (build-asset-cfg cfg)
+  (say (str "» curl --parallel-max " (str PARALLEL_MAX) " 批量下载资源(" asset-count " 个, 静默)..."))
+  (proc-run "curl" (list "-s" "-S" "-Z" "--parallel-max" (str PARALLEL_MAX) "--create-dirs" "-K" cfg))
+  (set! asset-fails '())
+  (verify-assets)
+  (say (str "  校验完成: 失败/缺失 " afailed " 个"))
+  (if (> afailed 0) (retry-failed) 0))
+
+;; 串行兜底(原逻辑): Nuomi 逐个 http-download + SHA1
+(define (download-assets-serial)
+  (define ai 0)
+  (while (< ai asset-count)
+    (let* ((e (get (json-get asset-objs "objects") ai))
+           (h (json-get (cdr e) "hash"))
+           (r (download-verify (str ASSET_BASE (substring h 0 2) SEP h)
+                               (str ASSETS_DIR SEP "objects" SEP (substring h 0 2) SEP h) h)))
+      (if (= r -1) (set! afailed (+ afailed 1)) 0))
+    (if (= (% (+ ai 1) 100) 0)
+        (say (str "  资源进度 " (+ ai 1) "/" asset-count))
+        0)
+    (set! ai (+ ai 1))))
+
+;; ============================================================
+;;  启动参数解析(arguments.jvm / arguments.game)
+;; ============================================================
+
+;; 一个参数元素是否应被纳入(纯字符串恒纳入; 带 rules 的按规则判定)
+(define (element-included? el)
+  (if (string? el) true (rules-decide (json-get el "rules"))))
+
+;; 取出一个元素的 value(可能是字符串或字符串向量), 返回字符串列表
+(define (element-values el)
+  (if (string? el)
+      (list el)
+      (let ((v (json-get el "value")))
+        (if (null? v) (list)
+          (if (string? v) (list v)
+            (map (lambda (x) x) v))))))
+
+;; 占位符替换(读取运行态全局)
+(define (substitute s)
+  (define subs (list
+    (list "${natives_directory}" NATIVES_DIR)
+    (list "${launcher_name}" LAUNCHER_NAME)
+    (list "${launcher_version}" LAUNCHER_VERSION)
+    (list "${classpath}" CLASSPATH)
+    (list "${auth_player_name}" USERNAME)
+    (list "${version_name}" TARGET_VERSION)
+    (list "${game_directory}" INSTANCE_DIR)
+    (list "${assets_root}" ASSETS_DIR)
+    (list "${assets_index_name}" ASSET_ID)
+    (list "${auth_uuid}" UUID)
+    (list "${auth_access_token}" TOKEN)
+    (list "${clientid}" CLIENT_ID)
+    (list "${auth_xuid}" XUID)
+    (list "${user_type}" "mojang")
+    (list "${version_type}" "release")))
+  (define i 0)
+  (define res s)
+  (define pair nil)
+  (while (< i (length subs))
+    (let* ((pair (get subs i))
+           (k (get pair 0))
+           (v (get pair 1)))
+      (if (and (string? res) (string? k) (string? v))
+          (set! res (str-replace res k v))
+          (say (str "  [sub warn] skip res?=" (string? res) " k?=" (string? k) " v?=" (string? v) " k=" k))))
+    (set! i (+ i 1)))
+  res)
+
+(define (substitute-all lst) (map substitute lst))
+
+;; 解析一段参数(向量): 过滤 -> 取值 -> 替换占位符, 返回字符串列表
+(define (resolve-section-rec section i out)
+  (if (>= i (length section)) out
+    (let* ((el (get section i))
+           (nout (if (element-included? el)
+                     (append out (substitute-all (element-values el)))
+                     out)))
+      (resolve-section-rec section (+ i 1) nout))))
+(define (resolve-section section) (resolve-section-rec section 0 '()))
+
+;; ============================================================
+;;  依赖 / 原生库描述
+;;
+;;  每个条目格式: [kind, 相对路径, URL, sha1]
+;;    kind = "lib"    -> 进 classpath
+;;    kind = "native" -> 解压进 natives 目录, 不进 classpath
+;;
+;;  两种原生库写法都支持:
+;;    新(1.19+): name 带 classifier, 如 org.lwjgl:lwjgl:3.3.3:natives-windows
+;;    旧(1.19 前): lib.natives.<os> 指向 downloads.classifiers 的键
+;; ============================================================
+
+;; 造一个条目: [kind, 相对路径, URL, sha1]
+;; url 优先用元数据里给的地址(CDN 会变, 硬拼 base 迟早失效); 没有再退回 LIB_BASE
+(define (make-entry kind path url sha1)
+  (vec kind (str "libraries" SEP path)
+       (if (null? url) (str LIB_BASE path) url)
+       sha1))
+
+;; 一个库条目展开成的条目列表(0~2 个)
+(define (lib-entries-of lib)
+  (define name (json-get lib "name"))
+  (define art (json-get lib "downloads" "artifact"))
+  (define cls (name-classifier name))
+  (define natives (json-get lib "natives"))
+  (define out '())
+  ;; 新格式: name 带 classifier -> 整个条目就是原生库
+  (if (not (null? cls))
+      (if (not (null? art))
+          (set! out (list (make-entry "native" (json-get art "path")
+                                      (json-get art "url") (json-get art "sha1"))))
+          0)
+      0)
+  ;; 旧格式: natives.<os> -> classifiers 里的键
+  (if (not (null? natives))
+      (let ((oc (json-get natives OS)))
+        (if (not (null? oc))
+            (let ((ent (json-get lib "downloads" "classifiers" oc)))
+              (if (not (null? ent))
+                  (set! out (append out
+                                    (list (make-entry "native" (json-get ent "path")
+                                                      (json-get ent "url")
+                                                      (json-get ent "sha1")))))
+                  0))
+            0))
+      0)
+  ;; 普通库(进 classpath)
+  (if (null? cls)
+      (if (not (null? art))
+          (set! out (append out
+                            (list (make-entry "lib" (json-get art "path")
+                                              (json-get art "url")
+                                              (json-get art "sha1")))))
+          ;; 少数条目没有 downloads.artifact, 用 maven 坐标兜底
+          (set! out (append out (list (make-entry "lib" (maven-path name) nil nil)))))
+      0)
+  out)
+
+;; 一个库条目是否应该纳入(rules + classifier 里的平台/架构)
+(define (lib-included? lib)
+  (if (not (rules-decide (json-get lib "rules"))) false
+    (let* ((cls (name-classifier (json-get lib "name")))
+           (cos (if (null? cls) nil (classifier-os cls)))
+           (carch (if (null? cls) nil (classifier-arch cls))))
+      (if (and (not (null? cos)) (not (equal? cos (os-token)))) false
+        (if (and (not (null? carch)) (not (equal? carch ARCH))) false true)))))
+
+;; 递归收集某个版本的全部依赖条目(已按平台/架构过滤)
+(define (collect-libs libs i acc)
+  (if (>= i (length libs)) acc
+    (let* ((lib (get libs i))
+           (nacc (if (lib-included? lib)
+                     (append acc (lib-entries-of lib))
+                     acc)))
+      (collect-libs libs (+ i 1) nacc))))
+
+;; 全部依赖条目(含原生库)
+(define (lib-entries vmeta) (collect-libs (json-get vmeta "libraries") 0 '()))
+
+;; ============================================================
+;;  离线 UUID / Token 生成(随机 v4, 离线模式足够)
+;; ============================================================
+(define (rand-hex)
+  (define d (random 16))
+  (if (< d 10) (get "0123456789" d) (get "abcdef" (- d 10))))
+(define (uuid-variant) (get "89ab" (random 4)))
+(define (make-uuid)
+  (str (rand-hex)(rand-hex)(rand-hex)(rand-hex)(rand-hex)(rand-hex)(rand-hex)(rand-hex)
+       "-"
+       (rand-hex)(rand-hex)(rand-hex)(rand-hex)
+       "-4"
+       (rand-hex)(rand-hex)(rand-hex)
+       "-"
+       (uuid-variant)(rand-hex)(rand-hex)(rand-hex)
+       "-"
+       (rand-hex)(rand-hex)(rand-hex)(rand-hex)(rand-hex)(rand-hex)(rand-hex)(rand-hex)(rand-hex)(rand-hex)(rand-hex)(rand-hex)))
+(define (make-token)
+  (define i 0)
+  (define s "")
+  (while (< i 40) (set! s (str s (rand-hex))) (set! i (+ i 1)))
+  s)
+
+;; ============================================================
+;;  主流程
+;; ============================================================
+(define (run)
+  ;; 有效模式: 环境变量 NUOMI_MODE 优先, 否则用 CONFIG
+  (define dry? DRY_RUN)
+  (define launch? LAUNCH?)
+  ;; 若 GUI 前端传了玩家名, 覆盖默认(离线名)
+  (define un (getenv "NUOMI_USERNAME"))
+  (if (and (not (null? un)) (not (equal? un ""))) (set! USERNAME un) 0)
+  (if (not (null? MODE))
+      (begin
+        (if (equal? MODE "dry") (begin (set! dry? true) (set! launch? false)) 0)
+        (if (equal? MODE "download") (begin (set! dry? false) (set! launch? false)) 0)
+        (if (equal? MODE "launch") (begin (set! dry? false) (set! launch? true)) 0))
+      0)
+
+  (say "=== Nuomi 启动器 v0.1 ===")
+  (say (str "  目标版本: " TARGET_VERSION "   玩家: " USERNAME "   RAM: " RAM_MB "M"))
+  (say (str "  模式: " (if dry? "DRY-RUN (仅规划)" (if launch? "下载并启动" "下载(不启动)"))))
+  (say "")
+
+  ;; 运行态变量(全部用 set!, 避免在 begin 里 define)
+  (define ok true)
+  (define manifest nil)
+  (define versions nil)
+  (define hit nil)
+  (define vmeta-url nil)
+  (define vmeta nil)
+  (define client-url nil)
+  (define client-sha nil)
+  (define client-size nil)
+  (define vmeta-libs nil)
+  (define all-descs nil)
+  (define lib-descs nil)
+  (define native-descs nil)
+  (define asset-idx-url nil)
+  (define asset-idx-id nil)
+  (define asset-idx-sha nil)
+  (define idx-local nil)
+  (define idx-body nil)
+  (define client-lp nil)
+  (define classpath-list nil)
+  (define args-obj nil)
+  (define jvm-args nil)
+  (define game-args nil)
+  (define full-args nil)
+  (define failed-libs 0)
+  (define ni 0)
+
+  ;; 1) 版本清单
+  (say "» 拉取 Mojang 版本清单...")
+  (set! manifest (json-parse (http-get PISTON_MANIFEST UA)))
+  (if (null? manifest) (set! ok false))
+  (if ok (begin
+    (set! versions (json-get manifest "versions"))
+    (set! hit (filter (lambda (v) (equal? (json-get v "id") TARGET_VERSION)) versions))
+    (if (null? hit)
+        (begin (say (str "  ✘ 清单里找不到版本 " TARGET_VERSION)) (set! ok false))
+        (set! vmeta-url (json-get (car hit) "url")))))
+
+  ;; 2) 版本元数据
+  (if ok (begin
+    (say (str "» 拉取版本元数据: " (short vmeta-url)))
+    (set! vmeta (json-parse (http-get vmeta-url UA)))
+    (if (null? vmeta) (set! ok false))))
+  (if ok (begin
+    (if (not (null? (json-get vmeta "mainClass"))) (set! MAIN_CLASS (json-get vmeta "mainClass")) 0)
+    (set! client-url (json-get vmeta "downloads" "client" "url"))
+    (set! client-sha (json-get vmeta "downloads" "client" "sha1"))
+    (set! client-size (json-get vmeta "downloads" "client" "size"))
+    (set! vmeta-libs (json-get vmeta "libraries"))
+    (set! all-descs (lib-entries vmeta))
+    (set! lib-descs (filter (lambda (d) (equal? (get d 0) "lib")) all-descs))
+    (set! native-descs (filter (lambda (d) (equal? (get d 0) "native")) all-descs))
+    (set! asset-idx-url (json-get vmeta "assetIndex" "url"))
+    (set! asset-idx-id (json-get vmeta "assetIndex" "id"))
+    (set! asset-idx-sha (json-get vmeta "assetIndex" "sha1"))
+    (say (str "  client.jar: " (short client-url) "  (" client-size " B)"))
+    (say (str "  依赖库: " (length lib-descs) "   原生库: " (length native-descs) "   资源索引: " asset-idx-id))))
+
+  ;; 3) 目录与 classpath
+  (if ok (begin
+    (set! INSTANCE_DIR (str BASE_DIR SEP "instances" SEP TARGET_VERSION))
+    (set! NATIVES_DIR (str INSTANCE_DIR SEP "natives"))
+    (set! ASSETS_DIR (str BASE_DIR SEP "assets"))
+    (set! client-lp (str BASE_DIR SEP "versions" SEP TARGET_VERSION SEP TARGET_VERSION ".jar"))
+    ;; 先把实例目录建出来(unzip 原生库、放置游戏文件都要用)
+    (mkdirs INSTANCE_DIR)
+    (mkdirs NATIVES_DIR)
+    ;; classpath 每项都必须是绝对路径(java 不会相对 CWD 解析 -cp 里的相对项)
+    ;; 条目格式: [kind, 相对路径, URL, sha1]
+    ;; ⚠️ 原生库 jar 也必须进 classpath: LWJGL 3.3 是从 classpath 资源里找
+    ;;    windows/x64/org/lwjgl/*.dll 自己解压的, 不在 classpath 上就加载不了。
+    (set! classpath-list
+          (append (cons client-lp
+                       (map (lambda (d) (str BASE_DIR SEP (get d 1))) lib-descs))
+                  (map (lambda (d) (str BASE_DIR SEP (get d 1))) native-descs)))
+    (set! CLASSPATH (str-join classpath-list PATH_SEP))
+    (say (str "  实例目录: " INSTANCE_DIR))
+    (say (str "  classpath 含 " (length classpath-list) " 项"))))
+
+  ;; 4) 资源索引(用于统计对象数)
+  (if ok (begin
+    (set! idx-local (str ASSETS_DIR SEP "indexes" SEP asset-idx-id ".json"))
+    (if dry?
+        (begin
+          (set! idx-body (http-get asset-idx-url UA))
+          (set! asset-objs (json-parse idx-body))
+          (if (null? asset-objs)
+              (say "  (资源索引解析失败, 跳过统计)")
+              (set! asset-count (length (json-get asset-objs "objects")))))
+        (begin
+          (download-verify asset-idx-url idx-local asset-idx-sha)
+          (set! asset-objs (json-parse (read-file idx-local)))
+          (if (null? asset-objs)
+              (say "  ✘ 资源索引解析失败")
+              (set! asset-count (length (json-get asset-objs "objects"))))))
+    (if (not (null? asset-objs))
+        (say (str "  资源对象: " asset-count " 个")))))
+
+  ;; 5) 下载阶段(仅非 dry-run)
+  (if (and ok (not dry?)) (begin
+    (say "» 下载阶段...")
+    ;; client.jar
+    (download-verify client-url client-lp client-sha)
+    ;; 依赖库(条目: [kind, 相对路径, URL, sha1])
+    (set! failed-libs (download-descs lib-descs "依赖库"))
+    ;; 原生库: 下载 + 解压到 natives 目录
+    (say (str "» 下载原生库 (" (length native-descs) " 个)并解压..."))
+    (set! ni 0)
+    (while (< ni (length native-descs))
+      (let* ((d (get native-descs ni))
+             (dest (str BASE_DIR SEP (get d 1)))
+             (r (download-verify (get d 2) dest (get d 3))))
+        (if (= r -1) (set! failed-libs (+ failed-libs 1)) 0)
+        (unzip dest NATIVES_DIR)
+        0)
+      (set! ni (+ ni 1)))
+    (say (str "  ✓ 原生库解压完毕 -> " NATIVES_DIR))
+    ;; 资源包(每个对象一个 sha1 命名的文件)
+    (if (and DOWNLOAD_ASSETS (not (null? asset-objs)))
+        (begin
+          (set! afailed 0)
+          (if USE_CURL_PARALLEL
+              (download-assets-parallel)
+              (download-assets-serial))
+          (say (str "  ✓ 资源对象处理完毕, 失败 " afailed " 个")))
+        (say "  (已跳过资源包下载)"))))
+
+  ;; 6) 组装启动命令
+  (if ok (begin
+    (set! UUID (make-uuid))
+    (set! TOKEN (make-token))
+    (set! ASSET_ID asset-idx-id)
+    (set! args-obj (json-get vmeta "arguments"))
+    (if (null? args-obj)
+        (begin
+          ;; 旧版兼容: 最小参数集
+          (set! jvm-args (list "-Xss1M" (str "-Xmx" RAM_MB "M")
+                                (str "-Djava.library.path=" NATIVES_DIR)
+                                "-cp" CLASSPATH))
+          (set! game-args (list "--username" USERNAME "--version" TARGET_VERSION
+                                "--gameDir" INSTANCE_DIR "--assetsDir" ASSETS_DIR
+                                "--assetIndex" ASSET_ID "--uuid" UUID
+                                "--accessToken" TOKEN "--userType" "mojang"
+                                "--versionType" "release"))
+          (set! full-args (append jvm-args (cons MAIN_CLASS game-args))))
+        (begin
+          (set! jvm-args (resolve-section (json-get vmeta "arguments" "jvm")))
+          (set! game-args (resolve-section (json-get vmeta "arguments" "game")))
+          (set! full-args (append jvm-args (cons MAIN_CLASS game-args)))))
+    (say "")
+    (say "» 启动命令:")
+    (say (str "  " JAVA_CMD " " (str-join full-args " ")))))
+
+  ;; 7) 启动
+  (if (and ok (not dry?) launch?)
+      (begin
+        (say "» 正在启动 Minecraft...")
+        (proc-run JAVA_CMD full-args))
+      (if (and ok (not dry?))
+          (say "» 下载完成(未启动)。把 LAUNCH? 改成 true 即可启动。")
+          (if ok (say "» DRY-RUN 完成: 以上为规划, 未实际下载/启动。"))))
+
+  (if (not ok) (say "✘ 流程因错误中止。") 0))
+
+;; 启动
+(run)
