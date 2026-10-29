@@ -184,7 +184,7 @@
     (if (not done) (draw ui) 0)
     ;; 帧计数(光标闪烁用) + 节流
     (set! frame (+ frame 1))
-    (sleep 16)))
+    (sleep 16))))
 
 ;; ---------- 入口 ----------
 (define (gui-main)
