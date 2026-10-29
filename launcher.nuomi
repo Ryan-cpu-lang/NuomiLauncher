@@ -26,7 +26,7 @@
 ;;   不设/其它 -> 照 CONFIG 里的 DRY_RUN / LAUNCH? 走
 (define MODE (getenv "NUOMI_MODE"))
 (define TARGET_VERSION "1.21.4")  ; Piston 上真实存在的版本
-(define USERNAME "Tracgiture")    ; 离线玩家名 (默认用你的正版角色)
+(define USERNAME "Player")        ; 离线玩家名 (默认占位名, 离线模式任意非空即可; 想换就改这里或用 NUOMI_USERNAME 环境变量)
 (define RAM_MB 2048)
 (define JAVA_CMD "java")          ; 可改成 java.exe 绝对路径
 (define OS "windows")             ; windows / linux / osx

@@ -40,7 +40,7 @@
 
 ;; ---------- 状态 ----------
 (define USERNAME (let ((u (getenv "NUOMI_USERNAME")))
-                   (if (or (null? u) (equal? u "")) "Tracgiture" u)))
+                   (if (or (null? u) (equal? u "")) "" u)))
 (define GAME_DIR (let ((d (getenv "NUOMI_GAME_DIR")))
                    (if (or (null? d) (equal? d "")) (str (getenv "USERPROFILE") "/.nuomi-mc") d)))
 (define VERSION "1.21.4")

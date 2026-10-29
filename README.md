@@ -46,7 +46,7 @@ nuomi.exe gui.nuomi
 界面长这样（自绘窗口，无第三方库）：
 
 - **标题栏**：`Nuomi MC Launcher` + 版本号
-- **玩家名输入框**：点一下就能打字，最多 16 字，`Backspace` 删除，空着会用默认 `Tracgiture`
+- **玩家名输入框**：点一下就能打字，最多 16 字，`Backspace` 删除；不再预填任何名字，空着会显示占位提示「输入玩家名…」，请自己输入
 - **启动游戏** 按钮：下载全部资源并启动 Minecraft
 - **下载资源** 按钮：只下载，不启动
 - **状态文字** + **进度条**：显示后台任务进行到哪（库 N/total、资源 N/total）
@@ -66,7 +66,7 @@ nuomi.exe gui.nuomi
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `TARGET_VERSION` | `1.21.4` | 要启动的版本（Piston 上真实存在的版本号） |
-| `USERNAME` | `Tracgiture` | 离线玩家名 |
+| `USERNAME` | `Player` | 离线玩家名（默认占位名，可改这里或用 `NUOMI_USERNAME` 环境变量覆盖） |
 | `RAM_MB` | `2048` | 堆内存上限（`-Xmx`） |
 | `JAVA_CMD` | `java` | java 可执行文件 |
 | `OS` | `windows` | `windows` / `linux` / `osx`，用于规则匹配 |
