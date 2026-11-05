@@ -218,7 +218,7 @@ set NUOMI_MODE=auth-littleskin  && nuomi.exe launcher.nuomi   :: LittleSkin 外�
 > 全局管理员，**应用注册永久免费**，但微软会要**手机号 + 信用卡做身份验证**（临时预授权、不扣费，
 > 需实体卡）。M365 开发人员计划 2026 年资格已收紧，纯个人通常显示「不符合资格」；
 > External ID 30 天试用租户不要卡但到期删除，client_id 会跟着失效，只适合临时验证。
-> 详见操作卡 [`azure-appid-guide.html`](./azure-appid-guide.html) 的 ⓪ 节。
+> 详见操作卡 [`azure-appid-guide.html`](https://ryan-cpu-lang.github.io/azure-appid-guide.html) 的 ⓪ 节。
 
 > ⚠️ **门槛一：必须自备 Azure 应用的 client_id**。
 > 早期各开源启动器共用的公共 ID `00000000402b5328` **已被微软从目录中移除**
@@ -234,7 +234,8 @@ set NUOMI_MODE=auth-littleskin  && nuomi.exe launcher.nuomi   :: LittleSkin 外�
 7. 回到 **Overview**，抄下两个 UUID：**Application (client) ID**（启动器要填的）和 **Directory (tenant) ID**（Mojang 审核表必填）。别拿成 Object ID
 8. 把 client ID 粘贴到启动器「账户登录」页的 **微软 client_id** 输入框，点「保存」
 
-> 📖 带每一步按钮位置和表单填写模板的图文版：[`azure-appid-guide.html`](./azure-appid-guide.html)（可离线双击打开）。
+> 📘 **端到端图文教程（玩家向，照着点就能登）**：<https://ryan-cpu-lang.github.io/ms-login-tutorial.html>（官网，始终最新）。
+> 📖 应用注册每一步按钮位置和表单模板的详细图文卡：<https://ryan-cpu-lang.github.io/azure-appid-guide.html>
 
 配置存在 `%USERPROFILE%/.nuomi-mc/ms_client_id.txt`，填一次即可，之后不用再管。
 启动参数会带 `--clientId` / `--xuid` / `--userType msa` / `--accessToken`。
