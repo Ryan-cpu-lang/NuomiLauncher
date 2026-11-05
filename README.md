@@ -214,12 +214,14 @@ set NUOMI_MODE=auth-littleskin  && nuomi.exe launcher.nuomi   :: LittleSkin 外�
 
 1. 打开 <https://portal.azure.com>，用你的微软账号登录
 2. 搜索并进入 **Microsoft Entra ID** → 左侧 **App registrations** → **New registration**
-3. Name 随便填（比如 `NuomiLauncher`）
-4. **Supported account types** 选 **Accounts in any organizational directory (Any Azure AD directory - Multitenant) and personal Microsoft accounts (e.g. Skype, Xbox)** —— 也就是要包含「个人 Microsoft 账户」
-5. Redirect URI 留空，点 **Register**
+3. Name 填 `NuomiLauncher` 之类（**别含** Mojang / Minecraft / Microsoft / Live / Xbox / Discord / Hypixel，Mojang 审核会因命名打回）
+4. **Supported account types** 选 **Accounts in any organizational directory (Any Azure AD directory - Multitenant) and personal Microsoft accounts (e.g. Skype, Xbox)** —— 也就是要包含「个人 Microsoft 账户」；选「Personal Microsoft accounts only」也行，**不能**选「仅此组织目录」
+5. Redirect URI 留空，点 **Register**（设备码流不需要回调）
 6. 创建后进应用的 **Authentication** 页，找到 **Allow public client flows**，把它设为 **Yes**（设备码流必需，否则仍会报 unauthorized_client），记得保存
-7. 回到 **Overview**，复制 **Application (client) ID**（一串 UUID 格式）
-8. 粘贴到启动器「账户登录」页的 **微软 client_id** 输入框，点「保存」
+7. 回到 **Overview**，抄下两个 UUID：**Application (client) ID**（启动器要填的）和 **Directory (tenant) ID**（Mojang 审核表必填）。别拿成 Object ID
+8. 把 client ID 粘贴到启动器「账户登录」页的 **微软 client_id** 输入框，点「保存」
+
+> 📖 带每一步按钮位置和表单填写模板的图文版：[`azure-appid-guide.html`](./azure-appid-guide.html)（可离线双击打开）。
 
 配置存在 `%USERPROFILE%/.nuomi-mc/ms_client_id.txt`，填一次即可，之后不用再管。
 启动参数会带 `--clientId` / `--xuid` / `--userType msa` / `--accessToken`。
@@ -227,8 +229,23 @@ set NUOMI_MODE=auth-littleskin  && nuomi.exe launcher.nuomi   :: LittleSkin 外�
 > ⚠️ **门槛二：新应用还要过 Mojang 白名单审批**。
 > 新注册的 Azure 应用默认无权调用 Minecraft Java API，`login_with_xbox` 会返回
 > 403 `Invalid app registration`。需到 <https://aka.ms/mce-reviewappid> 提交
-> 「Java Edition Game Service API Review」（填 client ID、应用名、项目地址、用途），
-> **人工审核数天到数周**。这一关换任何 OAuth 2.0 流程都绕不过去，也不是代码问题。
+> 「AppID Review」表单，**每周审一批**，重复提交不会更快。表单共 9 项，除第 9 项可留空外都要填：
+>
+> | # | 字段 | 填什么 |
+> |---|---|---|
+> | 1 | 已阅读 EULA 与使用指南 | Yes（<http://aka.ms/mcusageguidelines>） |
+> | 2 | Contact Information | 注册 Azure 应用时用的微软账号邮箱（官方会与 Azure 门户交叉核对） |
+> | 3 | What type of request | New AppID for Approval |
+> | 4 | Application Name | 与 Azure 里一致，且不含 Mojang/Minecraft/Microsoft/Live/Xbox/Discord/Hypixel |
+> | 5 | Application ID | Overview 里的 Application (client) ID，一次只提交一个 |
+> | 6 | Tenant ID | Overview 里的 **Directory (tenant) ID**，新应用必填 |
+> | 7 | Associated website or domain | `https://github.com/Ryan-cpu-lang/NuomiLauncher` |
+> | 8 | Justification | 说明这是开源非商业启动器、**完整走正版认证并验证游戏所有权、不绕过任何校验**（英文模板见操作卡） |
+> | 9 | Any other information | 留空 / N/A |
+>
+> 官方明确要求「应用必须验证游戏所有权、并在进入游戏前要求认证」，绕过正版验证的一律不批；
+> 本启动器走完整正版链路，符合该要求。这一关换任何 OAuth 2.0 流程都绕不过去，也不是代码问题。
+> **注意**：自己的 Directory (tenant) ID 只给审核表用，代码里固定的 `consumers` 端点不要改。
 > 在批下来之前，LittleSkin 外置登录（8.2）或离线模式可正常使用。
 
 > 小提示：即使不登录，离线模式照样能玩单机；正版验证只在进正版服务器时需要。
