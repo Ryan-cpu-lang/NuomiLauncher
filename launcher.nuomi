@@ -285,6 +285,7 @@
 
 ;; 抓取字符串(走 curl 写临时文件再读回); 失败返回 nil
 (define FETCH_TMP (str BASE_DIR SEP "._fetch.tmp"))
+(define POST_BODY_TMP (str BASE_DIR SEP "._post.tmp"))
 (define (fetch-str url)
   (curl-download url FETCH_TMP)
   (if (and (exists? FETCH_TMP) (> (file-size FETCH_TMP) 0))
@@ -644,10 +645,12 @@
 ;; ============================================================
 ;;  账户 / 登录 (离线 / 微软 / LittleSkin)
 ;; ============================================================
-;; 账户元组: (type name uuid token extra1 extra2 expires)
-;;   offline   : type=offline,   extra1/2=""
-;;   microsoft : type=microsoft, extra1=ms_refresh, extra2=xuid(uhs)
-;;   littleskin: type=littleskin, extra1=authserver, extra2=sessionserver
+;; 账户元组: (type name uuid token extra1 extra2 extra3)
+;;   offline   : extra1/2/3 = ""
+;;   microsoft : extra1=ms_refresh, extra2=xuid(uhs), extra3="0"
+;;   littleskin: extra1=authserver, extra2=sessionserver, extra3=clientToken
+;;               (Yggdrasil /refresh 必须带上与 accessToken 绑定的 clientToken;
+;;                旧版账户该列是 "0", 刷新时会提示重新登录一次以升级)
 (define (load-accounts)
   (if (not (null? ACCOUNTS_CACHE)) ACCOUNTS_CACHE
     (if (not (exists? ACCOUNTS_FILE)) (list)
@@ -703,10 +706,20 @@
 
 ;; ---- HTTP POST (curl; 返回解析后的 JSON, 失败/非 JSON 返回 nil/字符串) ----
 (define (http-post url body ctype)
+  ;; 请求体写文件再用 -d @file 传: 密码里的 " 和 \ 直接当命令行参数会被 Windows
+  ;; 命令解析拆坏(实测 curl 直接报 no URL specified)。
+  (ensure-parent POST_BODY_TMP)
+  (write-file POST_BODY_TMP body)
+  ;; 先删旧响应, 否则 curl 失败时会读到上一次的结果(曾把微软的 invalid_grant
+  ;; 误当成 LittleSkin 的登录结果返回)。
+  (if (exists? FETCH_TMP) (delete FETCH_TMP) 0)
   (if HAVE_CURL
-      (proc-run "curl" (list "-sS" "-L" "-k" "--retry" "3" "--retry-delay" "1"
-                             "-A" UA "-H" (str "Content-Type: " ctype) "-d" body "-o" FETCH_TMP url))
+      (proc-run "curl" (list "-sS" "-L" "-k" "--retry" "2" "--retry-delay" "1"
+                             "--connect-timeout" "8" "--max-time" "25"
+                             "-A" UA "-H" (str "Content-Type: " ctype)
+                             "-d" (str "@" POST_BODY_TMP) "-o" FETCH_TMP url))
       -1)
+  (if (exists? POST_BODY_TMP) (delete POST_BODY_TMP) 0)
   (if (and (exists? FETCH_TMP) (> (file-size FETCH_TMP) 0))
       (let ((s (read-file FETCH_TMP))) (if (json-body? s) (json-parse s) s))
       nil))
@@ -721,11 +734,14 @@
 ;; curl 的 -d 不做 url 编码, device_code / refresh_token 里一旦出现 + / = / & 
 ;; 就会被服务器当成表单语法切开, 报莫名其妙的 invalid_grant。统一走编码安全的通道。
 (define (http-post-form url fields)
-  (define args (list "-sS" "-L" "-k" "--retry" "3" "--retry-delay" "1" "-A" UA
+  (define args (list "-sS" "-L" "-k" "--retry" "2" "--retry-delay" "1"
+                     "--connect-timeout" "8" "--max-time" "25" "-A" UA
                      "-H" "Content-Type: application/x-www-form-urlencoded"))
   (while (not (null? fields))
     (set! args (append args (list "--data-urlencode" (car fields))))
     (set! fields (cdr fields)))
+  ;; 同样先删旧响应, 避免请求失败时误读上一次的 JSON
+  (if (exists? FETCH_TMP) (delete FETCH_TMP) 0)
   (if HAVE_CURL (proc-run "curl" (append args (list "-o" FETCH_TMP url))) -1)
   (if (and (exists? FETCH_TMP) (> (file-size FETCH_TMP) 0))
       (let ((s (read-file FETCH_TMP))) (if (json-body? s) (json-parse s) s))
@@ -736,6 +752,15 @@
 (define (jstr obj key)
   (let ((v (jget obj key)))
     (if (null? v) "" v)))
+
+;; 判断字符串是否包含子串: str-replace 后长度变短即命中(避开 string-search 返回值语义不确定)
+(define (str-has s sub)
+  (< (length (str-replace s sub "")) (length s)))
+
+;; JSON 字符串转义: 密码里的 \ 和 " 直接拼进请求体会把 JSON 拼坏, 导致登录莫名其妙失败
+;; 顺序必须是 \ 先于 " , 否则会把刚生成的 \" 里的反斜杠再转义一次
+(define (json-escape s)
+  (str-replace (str-replace s "\\" "\\\\") "\"" "\\\""))
 
 ;; OAuth2 / Xbox 错误码 -> 中文提示(原来一律显示「登录超时或被取消」, 根本不知道错在哪)
 (define (ms-oauth-error err desc)
@@ -895,7 +920,24 @@
                 (begin (say "  ✓ 令牌已刷新, 正在重建游戏会话")
                        (ms-finish resp old-ref))))))))))
 
-;; ---- LittleSkin 登录 (Yggdrasil 外置登录) ----
+;; ---- LittleSkin (Yggdrasil 外置登录 + 静默续期) ----
+;; LittleSkin 的错误文案是中英混排, 这里归类并补上用户能直接照做的建议
+(define (ls-error-msg resp)
+  (define em (jstr resp "errorMessage"))
+  (define er (jstr resp "error"))
+  (define msg (if (equal? em "") (if (equal? er "") "服务端未返回原因" er) em))
+  (if (or (str-has msg "Invalid credentials") (str-has msg "账号或密码错误")
+          (str-has msg "密码错误") (str-has msg "用户不存在"))
+      "账号或密码错误(用户名请填 LittleSkin 角色名)"
+    (if (or (str-has msg "Invalid access token") (str-has msg "access token")
+            (str-has msg "令牌无效") (str-has msg "令牌已过期"))
+        "登录已过期, 请重新输入密码登录一次"
+      (if (str-has msg "ForbiddenOperationException")
+          "操作被拒绝(令牌失效或账号异常), 请重新登录一次"
+        (if (str-has msg "IllegalArgumentException")
+            "请求格式有误(已带 agent 对象), 若持续出现请反馈"
+          msg)))))
+
 (define (littleskin-login-flow)
   (say "=== LittleSkin 登录 (外置登录) ===")
   (if (not (exists? LS_CRED_FILE))
@@ -906,9 +948,14 @@
       (if (< (length cred) 2)
           (begin (write-auth-status "error|凭据格式错误") 0)
         (begin
-          (define u (get cred 0)) (define p (get cred 1))
-          ;; LittleSkin 现在要求 agent 对象, 缺失会返回 400 IllegalArgumentException
+          ;; 密码里的 \ 和 " 必须先转义, 否则整个 JSON 请求体是坏的
+          (define u (json-escape (get cred 0)))
+          (define p (json-escape (get cred 1)))
+          ;; clientToken 由客户端生成并落到账户第 7 列, 供 /refresh 使用
+          (define ct (str-replace (make-uuid) "-" ""))
+          ;; LittleSkin 要求 agent 对象, 缺失会返回 400 IllegalArgumentException
           (define body (str "{\"username\":\"" u "\",\"password\":\"" p
+                            "\",\"clientToken\":\"" ct
                             "\",\"agent\":{\"name\":\"Minecraft\",\"version\":1}}"))
           (define resp (http-post (str LS_AUTH "/authenticate") body "application/json"))
           (if (null? resp)
@@ -918,21 +965,75 @@
               (begin
                 (define token (jstr resp "accessToken"))
                 (define sp (jstr resp "selectedProfile"))
+                (define srv-ct (jstr resp "clientToken"))
+                ;; 服务端有权返回自己的 clientToken; 没返回就用我们生成的
+                (define ct2 (if (or (null? srv-ct) (equal? srv-ct "")) ct srv-ct))
                 (if (or (equal? token "") (equal? sp ""))
                     (begin
-                      (define em (jstr resp "errorMessage"))
-                      (if (equal? em "") (set! em (jstr resp "error")) 0)
-                      (if (equal? em "") (set! em "认证失败") 0)
+                      (define em (ls-error-msg resp))
                       (write-auth-status (str "error|LittleSkin: " em))
                       (say (str "  ✘ " em)) 0)
                   (begin
                     (define name (jstr sp "name"))
                     (define uuid (jstr sp "id"))
-                    (define acct (list "littleskin" name uuid token LS_AUTH LS_SESSION "0"))
+                    (define acct (list "littleskin" name uuid token LS_AUTH LS_SESSION ct2))
                     (upsert-account acct)
                     (write-auth-status (str "ok|" name "|" uuid))
                     (say (str "  ✓ LittleSkin 登录成功: " name "  uuid=" uuid))
+                    (say "     clientToken 已保存, 之后可点「刷新」静默续期")
                     acct))))))))))
+
+;; ---- LittleSkin 静默续期 (Yggdrasil /refresh) ----
+;; 与微软的 OAuth refresh_token 对应: 用已保存的 accessToken + clientToken 换新令牌,
+;; 不用重输密码。令牌失效(改密码 / 异地登录 / 服务端作废旧 token)时会给明确中文提示。
+(define (ls-refresh-flow)
+  (say "=== LittleSkin 静默续期 ===")
+  (define acct (get-current-account))
+  (if (or (null? acct) (not (equal? (get acct 0) "littleskin")))
+      (begin (write-auth-status "error|当前账户不是 LittleSkin") (say "  ✘ 当前账户不是 LittleSkin") 0)
+    (begin
+      (define old-tok (get acct 3))
+      (define ct (get acct 6))
+      ;; 旧版账户第 7 列是 "0": 没存 clientToken 就没法 refresh, 只能重登一次
+      (if (or (null? ct) (equal? ct "") (equal? ct "0") (equal? old-tok ""))
+          (begin
+            (write-auth-status "error|该账户是旧格式(缺 clientToken), 请重新登录一次")
+            (say "  ✘ 缺 clientToken, 重新登录一次即可启用续期") 0)
+        (begin
+          (define body (str "{\"accessToken\":\"" (json-escape old-tok)
+                            "\",\"clientToken\":\"" (json-escape ct) "\"}"))
+          (define resp (http-post (str LS_AUTH "/refresh") body "application/json"))
+          (if (null? resp)
+              (begin (write-auth-status "error|LittleSkin 连接失败(网络/证书)") 0)
+            (if (string? resp)
+                (begin (write-auth-status (str "error|" (short resp))) 0)
+              (begin
+                (define new-tok (jstr resp "accessToken"))
+                (if (or (equal? new-tok "") (not (equal? (jstr resp "error") "")))
+                    (begin
+                      (define em (ls-error-msg resp))
+                      (write-auth-status (str "error|LittleSkin: " em))
+                      (say (str "  ✘ " em)) 0)
+                  (begin
+                    (define nct (jstr resp "clientToken"))
+                    (define nct2 (if (or (null? nct) (equal? nct "")) ct nct))
+                    (define sp (jstr resp "selectedProfile"))
+                    (define name (if (equal? sp "") (get acct 1) (jstr sp "name")))
+                    (define uuid (if (equal? sp "") (get acct 2) (jstr sp "id")))
+                    (define na (list "littleskin" name uuid new-tok LS_AUTH LS_SESSION nct2))
+                    (upsert-account na)
+                    (write-auth-status (str "ok|" name "|" uuid))
+                    (say (str "  ✓ 令牌已刷新: " name))
+                    na))))))))))
+
+;; 「刷新」按当前账户类型分流: 微软走 OAuth refresh_token, LittleSkin 走 Yggdrasil /refresh
+(define (auth-refresh-dispatch)
+  (define acct (get-current-account))
+  (if (null? acct)
+      (begin (write-auth-status "error|还没有已登录账户, 请先登录一次") 0)
+    (if (equal? (get acct 0) "microsoft") (ms-refresh-flow)
+      (if (equal? (get acct 0) "littleskin") (ls-refresh-flow)
+        (begin (write-auth-status "error|离线账户不需要刷新") 0)))))
 
 ;; ============================================================
 ;;  主流程
@@ -1149,7 +1250,7 @@
   (if (not (null? MODE))
       (if (equal? MODE "auth-ms") (ms-login-flow)
         (if (equal? MODE "auth-littleskin") (littleskin-login-flow)
-          (if (equal? MODE "auth-refresh") (ms-refresh-flow)
+          (if (equal? MODE "auth-refresh") (auth-refresh-dispatch)
             (run))))
       (run)))
 (auth-dispatch)

@@ -187,7 +187,7 @@ build.bat
 
 ```bat
 set NUOMI_MODE=auth-ms          && nuomi.exe launcher.nuomi   :: 微软设备码登录
-set NUOMI_MODE=auth-refresh     && nuomi.exe launcher.nuomi   :: 用 refresh token 静默续期
+set NUOMI_MODE=auth-refresh     && nuomi.exe launcher.nuomi   :: 按当前账户类型静默续期(微软 / LittleSkin)
 set NUOMI_MODE=auth-littleskin  && nuomi.exe launcher.nuomi   :: LittleSkin 外置登录
 ```
 
@@ -198,7 +198,7 @@ set NUOMI_MODE=auth-littleskin  && nuomi.exe launcher.nuomi   :: LittleSkin 外�
 | 环节 | 标准 | 说明 |
 |---|---|---|
 | 首次登录 | Device Authorization Grant（RFC 8628，设备码流） | 点「使用微软账号登录」→ 自动开浏览器 → 设备码**自动复制到剪贴板**，直接 Ctrl+V → 按服务端 `interval` 轮询；`slow_down` 自动降速，拒绝授权 / 过期 / 无效码都给具体原因 |
-| 续期 | Refresh Token（RFC 6749 §6） | 点主按钮右边的「**刷新**」，用存下来的 refresh token 静默换新令牌，**不开浏览器**；响应没带新 refresh token 时沿用旧的，不会把续期能力覆盖掉 |
+| 续期 | Refresh Token（RFC 6749 §6） | 点主按钮右边的「**刷新**」，用存下来的 refresh token 静默换新令牌，**不开浏览器**；响应没带新 refresh token 时沿用旧的，不会把续期能力覆盖掉。LittleSkin 账户的同名按钮走 Yggdrasil `/refresh`，见 8.2 |
 | 换游戏令牌 | Xbox Live / XSTS / Minecraft Services | XBL → XSTS → `login_with_xbox` → 取 MC profile；XSTS 的 `XErr` 错误码已翻成中文提示 |
 
 > 💡 **关于「换成 OAuth2 授权码流 + PKCE」**：技术上可行，但 Azure 应用要额外注册
@@ -278,11 +278,42 @@ GUI 只把它写进一个临时凭据文件，后台子进程读完立刻删除�
 > LittleSkin 的认证接口现在要求请求体带 `agent` 对象（`{"name":"Minecraft","version":1}`），
 > 少了会返回 400 `agent must be an object` —— 启动器已经带上了。
 
+#### 静默续期（不用重输密码）
+
+登录时会自己生成一个 `clientToken` 并跟着账户一起保存；登录按钮右边的「**刷新**」会调
+Yggdrasil `/refresh` 换一枚新的 `accessToken`，**不开浏览器、不用再输密码**。
+`auth-refresh` 命令会按当前账户类型自动分流：微软走 OAuth `refresh_token`，
+LittleSkin 走 `/refresh`，离线账户直接提示不用刷新。
+
+令牌过期（改密码、异地登录、服务端作废）时会给具体中文原因，例如
+「登录已过期，请重新输入密码登录一次」「账号或密码错误（用户名请填 LittleSkin 角色名）」，
+不再一律显示一串英文异常类名。**旧版账户**（第 7 列是 `0`、没存 clientToken）会提示
+重新登录一次以升级，之后就能一直用刷新。
+
+> 登录请求体走 `curl -d @文件` 传递，密码里的 `"`、`\` 会先做 JSON 转义：
+> 以前这类密码会把命令行和请求体一起拼坏，登录莫名其妙失败，现已修复。
+
+#### 多个角色怎么切
+
+LittleSkin 一个账号下可以有多个角色，**分别用各自的角色名 + 密码登录一次**即可，
+两个账户都会出现在「已登录账户」列表里，点一下就切换（启动参数会带对应 UUID 与令牌）。
+比如先用角色 A 登录、再用角色 B 登录，之后在列表里来回点就行，不用反复输密码。
+
+#### 排错速查
+
+| 现象 | 原因 / 处理 |
+|---|---|
+| 「账号或密码错误」 | 用户名要填 **LittleSkin 角色名**；也可试邮箱（取决于账号设置） |
+| 「登录已过期」 | 点「刷新」；仍失败就重新输入密码登录一次 |
+| 「该账户是旧格式(缺 clientToken)」 | 老版本存的账户，重新登录一次即可 |
+| 进服务器提示会话无效 | 令牌被服务端作废，点「刷新」，不行再重登 |
+| `agent must be an object` | 不该再出现；若出现说明接口又变了，请反馈 |
+
 ### 8.3 账户存储与切换
 
 | 文件 | 内容 |
 |---|---|
-| `.nuomi-mc/accounts.txt` | TAB 分隔 7 列：`type/name/uuid/token/extra1/extra2/expires` |
+| `.nuomi-mc/accounts.txt` | TAB 分隔 7 列：`type/name/uuid/token/extra1/extra2/extra3`。第 7 列微软恒为 `0`，LittleSkin 存 `clientToken`（`/refresh` 必需） |
 | `.nuomi-mc/account_current.txt` | 当前选中的账户 uuid |
 | `.nuomi-mc/.auth_result.txt` | 登录状态回传：`pending\|code\|uri` / `ok\|name\|uuid` / `error\|msg` |
 | `.nuomi-mc/ms_client_id.txt` | 你自己的 Azure client_id |

@@ -61,7 +61,9 @@
 (define CID_SAVE_X (+ MAIN_X 272)) (define CID_SAVE_Y CID_Y) (define CID_SAVE_W 72) (define CID_SAVE_H CID_H)
 (define LSU_X MAIN_X) (define LSU_LABEL_Y 276) (define LSU_Y 296) (define LSU_W MAIN_W) (define LSU_H 32)
 (define LSW_X MAIN_X) (define LSW_LABEL_Y 334) (define LSW_Y 354) (define LSW_W MAIN_W) (define LSW_H 32)
-(define LSB_X MAIN_X) (define LSB_Y 394) (define LSB_W MAIN_W) (define LSB_H 34)
+(define LSB_X MAIN_X) (define LSB_Y 394) (define LSB_W (- MAIN_W 80)) (define LSB_H 34)
+;; LittleSkin 右侧「刷新」: 与微软那个共用同一宽度/位置, 走 auth-refresh 按账户类型分流
+(define LS_REFRESH_X MS_REFRESH_X) (define LS_REFRESH_W MS_REFRESH_W)
 (define AC_TITLE_Y 434) (define AC_LIST_Y 452) (define AC_ITEM_H 20) (define AC_MAX 4)
 
 ;; ---------- 状态 ----------
@@ -397,6 +399,10 @@
   (window-shape ui 6 LSB_X LSB_Y LSB_W LSB_H (if ls-ready ACCENT BTN_DIS) 10)
   (window-text ui (center-x LSB_X LSB_W "登录 LittleSkin") (+ LSB_Y 10) 1 "登录 LittleSkin"
                 (if ls-ready WHITE DIM2))
+  ;; 右侧「刷新」: Yggdrasil /refresh 静默续期, 不用重输密码
+  (window-shape ui 6 LS_REFRESH_X LSB_Y LS_REFRESH_W LSB_H (if auth-busy BTN_DIS PANEL) 10)
+  (window-text ui (center-x LS_REFRESH_X LS_REFRESH_W "刷新") (+ LSB_Y 10) 1 "刷新"
+                (if auth-busy DIM2 ACCENT))
   ;; 已登录账户
   (window-text ui MAIN_X AC_TITLE_Y 1 "已登录账户（点击切换）" DIM)
   (if (null? accs)
@@ -569,10 +575,12 @@
                                             (if (not auth-busy) (begin (set! focus2 "lsu") (set! auth-msg "")) 0)
                                             (if (in-rect cx cy LSW_X LSW_Y LSW_W LSW_H)
                                                 (if (not auth-busy) (begin (set! focus2 "lsw") (set! auth-msg "")) 0)
-                                                ;; LittleSkin 登录按钮
-                                                (if (in-rect cx cy LSB_X LSB_Y LSB_W LSB_H)
-                                                    (if (and (not auth-busy) (not (equal? ls-user "")) (not (equal? ls-pass "")))
-                                                        (login-littleskin) 0)
+                                                ;; LittleSkin 登录 / 刷新按钮(同一行)
+                                                (if (in-rect cx cy LSB_X LSB_Y MAIN_W LSB_H)
+                                                    (if (in-rect cx cy LS_REFRESH_X LSB_Y LS_REFRESH_W LSB_H)
+                                                        (if (not auth-busy) (spawn-auth "auth-refresh") 0)
+                                                        (if (and (not auth-busy) (not (equal? ls-user "")) (not (equal? ls-pass "")))
+                                                            (login-littleskin) 0))
                                                     ;; 已存账户列表(点击切换)
                                                     (if (or (null? accs) (< (length accs) 1)) 0
                                                         (let ((idx (floor (/ (- cy AC_LIST_Y) AC_ITEM_H))))
