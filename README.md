@@ -207,12 +207,25 @@ set NUOMI_MODE=auth-littleskin  && nuomi.exe launcher.nuomi   :: LittleSkin 外�
 > 而**下面两道门槛一点没少**。所以目前保留设备码流，把力气花在续期和报错上。
 > 表单提交全部走 `curl --data-urlencode`（token 里的 `+ / =` 不会被误当表单语法切开）。
 
+> ⚠️ **门槛零（2026-11-05 实测）：个人微软账号必须先有一个 Microsoft Entra 目录（租户）**。
+> 微软自 **2024 年 6 月**起要求「所有应用必须注册在目录里」，取消了过去「只关联个人账号、
+> 不属于任何目录」的注册方式。只用个人 Microsoft 账号（买 MC 的那个）登录 Azure 门户，
+> 点「新注册」会被直接拦下：`在目录外部创建应用程序的功能已被弃用`；
+> 进 Entra 管理中心还会报 `AADSTS16000 ... account does not exist in tenant 'Microsoft Services'`，
+> 用户数 / 应用数全是 0。换浏览器或重新登录都无效。
+> 解决：① 优先用已有的工作 / 学校账号，或请某个租户的管理员把你加为成员（**免费、不用绑卡**）；
+> ② 否则注册 <https://azure.microsoft.com/free> 免费账号，会自动生成 Entra ID Free 租户并让你成为
+> 全局管理员，**应用注册永久免费**，但微软会要**手机号 + 信用卡做身份验证**（临时预授权、不扣费，
+> 需实体卡）。M365 开发人员计划 2026 年资格已收紧，纯个人通常显示「不符合资格」；
+> External ID 30 天试用租户不要卡但到期删除，client_id 会跟着失效，只适合临时验证。
+> 详见操作卡 [`azure-appid-guide.html`](./azure-appid-guide.html) 的 ⓪ 节。
+
 > ⚠️ **门槛一：必须自备 Azure 应用的 client_id**。
 > 早期各开源启动器共用的公共 ID `00000000402b5328` **已被微软从目录中移除**
 > （2026-11-05 实测仍返回 `AADSTS700016 unauthorized_client`）。借用官方启动器或别家启动器的
-> ID 违反微软应用条款，本项目不做。好在注册完全免费、不用信用卡，五分钟搞定：
+> ID 违反微软应用条款，本项目不做。应用注册本身免费，前提是已过门槛零：
 
-1. 打开 <https://portal.azure.com>，用你的微软账号登录
+1. 打开 <https://portal.azure.com> 登录，右上角头像确认「当前目录」是 `xxx.onmicrosoft.com` 的真实租户（不是纯 GUID 的隐式目录）
 2. 搜索并进入 **Microsoft Entra ID** → 左侧 **App registrations** → **New registration**
 3. Name 填 `NuomiLauncher` 之类（**别含** Mojang / Minecraft / Microsoft / Live / Xbox / Discord / Hypixel，Mojang 审核会因命名打回）
 4. **Supported account types** 选 **Accounts in any organizational directory (Any Azure AD directory - Multitenant) and personal Microsoft accounts (e.g. Skype, Xbox)** —— 也就是要包含「个人 Microsoft 账户」；选「Personal Microsoft accounts only」也行，**不能**选「仅此组织目录」
