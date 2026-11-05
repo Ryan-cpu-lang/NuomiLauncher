@@ -187,18 +187,30 @@ build.bat
 
 ```bat
 set NUOMI_MODE=auth-ms          && nuomi.exe launcher.nuomi   :: 微软设备码登录
+set NUOMI_MODE=auth-refresh     && nuomi.exe launcher.nuomi   :: 用 refresh token 静默续期
 set NUOMI_MODE=auth-littleskin  && nuomi.exe launcher.nuomi   :: LittleSkin 外置登录
 ```
 
 ### 8.1 微软账号（正版）
 
-走 **OAuth 设备码流**：点「使用微软账号登录」→ 自动打开浏览器 → 在页面输入界面显示的
-一次性代码 → 启动器后台轮询，登录成功后自动保存账户。
+登录本来就是**标准 OAuth 2.0**，分三段：
 
-> ⚠️ **必须自备 Azure 应用的 client_id**。
-> 早期各开源启动器共用的公共 ID `00000000402b5328` **已被微软从目录中移除**，
-> 现在会直接返回 `AADSTS700016 unauthorized_client`。第三方启动器只能用自己的应用 ID。
-> 好在注册完全免费、不用信用卡，五分钟搞定：
+| 环节 | 标准 | 说明 |
+|---|---|---|
+| 首次登录 | Device Authorization Grant（RFC 8628，设备码流） | 点「使用微软账号登录」→ 自动开浏览器 → 设备码**自动复制到剪贴板**，直接 Ctrl+V → 按服务端 `interval` 轮询；`slow_down` 自动降速，拒绝授权 / 过期 / 无效码都给具体原因 |
+| 续期 | Refresh Token（RFC 6749 §6） | 点主按钮右边的「**刷新**」，用存下来的 refresh token 静默换新令牌，**不开浏览器**；响应没带新 refresh token 时沿用旧的，不会把续期能力覆盖掉 |
+| 换游戏令牌 | Xbox Live / XSTS / Minecraft Services | XBL → XSTS → `login_with_xbox` → 取 MC profile；XSTS 的 `XErr` 错误码已翻成中文提示 |
+
+> 💡 **关于「换成 OAuth2 授权码流 + PKCE」**：技术上可行，但 Azure 应用要额外注册
+> `http://localhost:<端口>/callback` 回环 URI，还得起一个本地 HTTP 监听器（Nuomi 没有 server
+> 原语，得借 PowerShell / Python 临时起）；换来的收益只是省掉「粘贴设备码」一步，
+> 而**下面两道门槛一点没少**。所以目前保留设备码流，把力气花在续期和报错上。
+> 表单提交全部走 `curl --data-urlencode`（token 里的 `+ / =` 不会被误当表单语法切开）。
+
+> ⚠️ **门槛一：必须自备 Azure 应用的 client_id**。
+> 早期各开源启动器共用的公共 ID `00000000402b5328` **已被微软从目录中移除**
+> （2026-11-05 实测仍返回 `AADSTS700016 unauthorized_client`）。借用官方启动器或别家启动器的
+> ID 违反微软应用条款，本项目不做。好在注册完全免费、不用信用卡，五分钟搞定：
 
 1. 打开 <https://portal.azure.com>，用你的微软账号登录
 2. 搜索并进入 **Microsoft Entra ID** → 左侧 **App registrations** → **New registration**
@@ -210,8 +222,14 @@ set NUOMI_MODE=auth-littleskin  && nuomi.exe launcher.nuomi   :: LittleSkin 外�
 8. 粘贴到启动器「账户登录」页的 **微软 client_id** 输入框，点「保存」
 
 配置存在 `%USERPROFILE%/.nuomi-mc/ms_client_id.txt`，填一次即可，之后不用再管。
-登录链路：devicecode → XBL → XSTS → `login_with_xbox` → 取 MC profile，
 启动参数会带 `--clientId` / `--xuid` / `--userType msa` / `--accessToken`。
+
+> ⚠️ **门槛二：新应用还要过 Mojang 白名单审批**。
+> 新注册的 Azure 应用默认无权调用 Minecraft Java API，`login_with_xbox` 会返回
+> 403 `Invalid app registration`。需到 <https://aka.ms/mce-reviewappid> 提交
+> 「Java Edition Game Service API Review」（填 client ID、应用名、项目地址、用途），
+> **人工审核数天到数周**。这一关换任何 OAuth 2.0 流程都绕不过去，也不是代码问题。
+> 在批下来之前，LittleSkin 外置登录（8.2）或离线模式可正常使用。
 
 > 小提示：即使不登录，离线模式照样能玩单机；正版验证只在进正版服务器时需要。
 
@@ -264,4 +282,5 @@ GUI 账户页下方的「已登录账户」列表，点一下就能切换当前�
     （缺资源只有贴图/音效报错，**游戏照样能进主菜单**）
 - 不支持多实例切换（但**支持多账户切换**，见第八节）
 - 离线模式每次启动都是新 UUID（皮肤只有默认 Steve/Alex）；登录后使用真实账户
-- 微软登录需要你自己注册 Azure 应用并填 client_id（公共 ID 已被微软下架，见 8.1）
+- 微软登录需要你自己注册 Azure 应用并填 client_id（公共 ID 已被微软下架，见 8.1），
+  且新应用还需通过 Mojang 的 App ID **人工审核**（<https://aka.ms/mce-reviewappid>）才能登录成功

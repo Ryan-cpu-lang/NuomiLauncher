@@ -67,14 +67,21 @@
 ;; ============================================================
 ;;  登录相关配置 (离线 / 微软 / LittleSkin)
 ;; ============================================================
+;; 微软登录 = OAuth 2.0 Device Authorization Grant (RFC 8628, 设备码流)
+;;   + refresh_token 静默续期 (RFC 6749 §6)。两步都是标准 OAuth 2.0。
 ;; ⚠️ 社区公开 client_id (00000000402b5328) 已被微软从目录中移除(AADSTS700016),
-;;    设备码流会直接报 unauthorized_client。第三方启动器必须用自己注册的 Azure 应用:
-;;    在 https://portal.azure.com -> Microsoft Entra ID -> App registrations -> New registration
-;;    (账号类型选「个人 Microsoft 账户」) -> Authentication 页勾选 Allow public client flows
-;;    -> 复制 Application (client) ID, 填到启动器的「微软 client_id」输入框即可。
+;;    会直接报 unauthorized_client。第三方启动器必须用自己注册的 Azure 应用:
+;;    portal.azure.com -> Entra ID -> App registrations -> New registration
+;;    (账号类型选「个人 Microsoft 账户」) -> Authentication 勾 Allow public client flows
+;;    -> 复制 Application (client) ID 填到「账户登录」页的 client_id 输入框。
+;; ⚠️ 第二道门槛: 新注册的 Azure 应用默认不在 Mojang 白名单里,
+;;    login_with_xbox 会返回 403 Invalid app registration。需到 aka.ms/mce-reviewappid
+;;    提交 Java Edition Game Service API Review, 人工审核数天到数周。
+;;    这一关不是代码能绕过的, 换成 OAuth2 授权码流 + PKCE 也一样要过。
 (define MS_CLIENT_ID_DEFAULT "00000000402b5328")
-(define MS_TENANT "consumers")
-(define MS_SCOPE "XboxLive.signin%20offline_access")
+(define MS_SCOPE_RAW "XboxLive.signin offline_access")   ; --data-urlencode 用原文, curl 负责编码
+(define MS_TOKEN_URL "https://login.microsoftonline.com/consumers/oauth2/v2.0/token")
+(define MS_DEVICE_URL "https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode")
 (define LS_AUTH "https://littleskin.cn/api/yggdrasil/authserver")
 (define LS_SESSION "https://littleskin.cn/api/yggdrasil/sessionserver")
 
@@ -688,7 +695,11 @@
     (set! accs (cdr accs)))
   (if (null? accs) nil (car accs)))
 (define (get-current-account) (get-account-by-uuid (get-current-uuid)))
-(define (write-auth-status s) (write-file AUTH_RESULT_FILE s))
+;; ⚠️ 全新安装时 ~/.nuomi-mc 还不存在, write-file 不会自动建父目录,
+;;    不先 mkdirs 的话状态文件写不出去 -> GUI 会永远卡在「正在连接登录服务」。
+(define (write-auth-status s)
+  (ensure-parent AUTH_RESULT_FILE)
+  (write-file AUTH_RESULT_FILE s))
 
 ;; ---- HTTP POST (curl; 返回解析后的 JSON, 失败/非 JSON 返回 nil/字符串) ----
 (define (http-post url body ctype)
@@ -706,6 +717,19 @@
   (if (and (exists? FETCH_TMP) (> (file-size FETCH_TMP) 0))
       (let ((s (read-file FETCH_TMP))) (if (json-body? s) (json-parse s) nil))
       nil))
+;; form-encoded POST: 每个字段单独 --data-urlencode。
+;; curl 的 -d 不做 url 编码, device_code / refresh_token 里一旦出现 + / = / & 
+;; 就会被服务器当成表单语法切开, 报莫名其妙的 invalid_grant。统一走编码安全的通道。
+(define (http-post-form url fields)
+  (define args (list "-sS" "-L" "-k" "--retry" "3" "--retry-delay" "1" "-A" UA
+                     "-H" "Content-Type: application/x-www-form-urlencoded"))
+  (while (not (null? fields))
+    (set! args (append args (list "--data-urlencode" (car fields))))
+    (set! fields (cdr fields)))
+  (if HAVE_CURL (proc-run "curl" (append args (list "-o" FETCH_TMP url))) -1)
+  (if (and (exists? FETCH_TMP) (> (file-size FETCH_TMP) 0))
+      (let ((s (read-file FETCH_TMP))) (if (json-body? s) (json-parse s) s))
+      nil))
 (define (jget obj key) (if (null? obj) nil (json-get obj key)))
 ;; json 取值统一成字符串: key 缺失时(json-get 可能返回 nil 或 "")一律给 ""
 ;; 判定「字段缺失」要用 (equal? v "") 而不是 (null? v), 否则缺字段会被误当成有值。
@@ -713,7 +737,28 @@
   (let ((v (jget obj key)))
     (if (null? v) "" v)))
 
-;; ---- 微软登录 (OAuth 设备码流) ----
+;; OAuth2 / Xbox 错误码 -> 中文提示(原来一律显示「登录超时或被取消」, 根本不知道错在哪)
+(define (ms-oauth-error err desc)
+  (if (equal? err "")
+      (if (equal? desc "") "Microsoft 返回异常(可能被网络拦截或证书问题)" desc)
+    (if (equal? err "authorization_declined") "你拒绝了授权, 登录已取消"
+    (if (equal? err "expired_token") "设备码已过期, 请重新点登录"
+      (if (equal? err "bad_verification_code") "设备码无效, 请重新点登录"
+        (if (equal? err "unauthorized_client") "client_id 无效: 请填自己注册的 Azure 应用 ID"
+          (if (equal? err "invalid_grant") "refresh token 已失效, 请重新登录一次"
+            (if (equal? desc "") (str "Microsoft 返回错误: " err)
+              (str "Microsoft 返回错误: " desc)))))))))
+(define (ms-xerr-msg xsts)
+  (define xe (jget xsts "XErr"))
+  (if (number? xe)
+      (if (= xe 2148916233) "该微软账号还没有 Xbox 档案, 请先去 minecraft.net 登录一次"
+        (if (= xe 2148916235) "Xbox Live 在当前地区不可用"
+          (if (or (= xe 2148916236) (= xe 2148916237)) "该账号需要完成年龄验证"
+            (if (= xe 2148916238) "儿童账号需由家长加入 Microsoft 家庭组"
+              (str "Xbox 认证失败 (XErr=" xe ")")))))
+    (str "Xbox 认证失败: " (jstr xsts "Message"))))
+
+;; ---- 微软登录 (OAuth 2.0 设备码流 + refresh_token 续期) ----
 (define (ms-xbl ms-token)
   (define body (str "{\"Properties\":{\"AuthMethod\":\"RPS\",\"SiteName\":\"user.auth.xboxlive.com\",\"RpsTicket\":\"d=" ms-token "\"},\"RelyingParty\":\"http://auth.xboxlive.com\",\"TokenType\":\"JWT\"}"))
   (http-post "https://user.auth.xboxlive.com/user/authenticate" body "application/json"))
@@ -729,13 +774,20 @@
            (xui-vec (if (null? xsts) nil (jget (jget xsts "DisplayClaims") "xui")))
            (uhs (if (or (null? xui-vec) (null? (get xui-vec 0))) "" (jstr (get xui-vec 0) "uhs"))))
       (if (or (equal? xsts-tok "") (equal? uhs ""))
-          (begin (write-auth-status "error|无法解析 XSTS 响应") nil)
+          (begin (write-auth-status (str "error|" (ms-xerr-msg xsts))) nil)
             (let* ((id-token (str "XBL3.0 x=" uhs ";t=" xsts-tok))
                (mc (http-post "https://api.minecraftservices.com/authentication/login_with_xbox"
                               (str "{\"identityToken\":\"" id-token "\"}") "application/json"))
                (mc-tok (jstr mc "access_token")))
           (if (equal? mc-tok "")
-              (begin (write-auth-status "error|Minecraft 服务登录失败(区域/网络)") nil)
+              (let* ((merr (jstr mc "error"))
+                     (mdesc (jstr mc "errorMessage"))
+                     (hint (if (equal? mdesc "")
+                               (if (equal? merr "")
+                                   "Minecraft 服务登录失败: 区域/网络异常, 或 Azure 应用未过 Mojang 审核(aka.ms/mce-reviewappid)"
+                                   (str "Minecraft 服务: " merr))
+                               mdesc)))
+                (begin (write-auth-status (str "error|" hint)) nil))
             (let* ((profile (http-get-auth "https://api.minecraftservices.com/minecraft/profile" mc-tok))
                    (pname (jstr profile "name"))
                    (puuid (jstr profile "id")))
@@ -748,15 +800,44 @@
                   (write-auth-status (str "ok|" pname "|" puuid))
                       (say (str "  ✓ 微软登录成功: " pname "  uuid=" puuid))
                       acct)))))))))
-(define (ms-finish msresp)
+(define (ms-finish msresp old-ref)
   (define ms-tok (jstr msresp "access_token"))
-  (define ms-ref (jstr msresp "refresh_token"))
+  (define ms-ref0 (jstr msresp "refresh_token"))
+  ;; 刷新响应可能不带新的 refresh_token, 这时必须沿用旧的,
+  ;; 否则账户会被覆盖成「没有 refresh token」, 下次又得开浏览器重登。
+  (define ms-ref (if (equal? ms-ref0 "") old-ref ms-ref0))
   (if (equal? ms-tok "") (begin (write-auth-status "error|微软令牌缺失") nil)
     (ms-chain ms-tok ms-ref)))
+;; 轮询 token 端点: 按 OAuth2 规定处理 authorization_pending / slow_down,
+;; 终态错误(拒绝授权 / 过期 / 无效码)给出具体原因, 不再一律报「超时」。
+(define (ms-poll-token dev-code interval0 expires-in)
+  (define got nil)
+  (define fatal nil)
+  (define interval interval0)
+  (define waited 0)
+  (while (and (null? got) (null? fatal) (< waited expires-in))
+    (begin
+      (sleep (* interval 1000))
+      (set! waited (+ waited interval))
+      (let ((resp (http-post-form MS_TOKEN_URL
+                     (list "grant_type=urn:ietf:params:oauth:grant-type:device_code"
+                           (str "client_id=" MS_CLIENT_ID)
+                           (str "device_code=" dev-code)))))
+        (if (or (null? resp) (string? resp)) 0
+          (let ((err (jstr resp "error")))
+            (if (equal? err "") (set! got resp)
+              (if (equal? err "authorization_pending") 0
+                (if (equal? err "slow_down")
+                    (set! interval (+ interval 5))
+                  (set! fatal (list err (jstr resp "error_description")))))))))))
+  (if (not (null? fatal))
+      (begin (write-auth-status (str "error|" (ms-oauth-error (get fatal 0) (get fatal 1)))) nil)
+    got))
+
 (define (ms-login-flow)
-  (say "=== 微软登录 (设备码流) ===")
-  (define dc (http-post (str "https://login.microsoftonline.com/" MS_TENANT "/oauth2/v2.0/devicecode")
-                        (str "client_id=" MS_CLIENT_ID "&scope=" MS_SCOPE) "application/x-www-form-urlencoded"))
+  (say "=== 微软登录 (OAuth 2.0 设备码流) ===")
+  (define dc (http-post-form MS_DEVICE_URL
+               (list (str "client_id=" MS_CLIENT_ID) (str "scope=" MS_SCOPE_RAW))))
   (if (string? dc)
       (begin (write-auth-status "error|Microsoft 返回非 JSON(可能被网络拦截或证书问题)")
              (say "  ✘ devicecode 响应不是 JSON") 0)
@@ -766,35 +847,53 @@
       (define user-code (jstr dc "user_code"))
       (define veri-uri (jstr dc "verification_uri"))
       (define dev-code (jstr dc "device_code"))
-      (if (or (equal? (jstr dc "user_code") "") (equal? (jstr dc "verification_uri") "") (equal? (jstr dc "device_code") ""))
-          (let* ((ed0 (jget dc "error_description"))
-                 (ed1 (jget dc "error"))
-                 (ed (if (null? ed0) (if (null? ed1) "Microsoft 返回异常" ed1) ed0)))
-            (if (equal? ed1 "unauthorized_client")
-                (begin
-                  (write-auth-status "error|微软 client_id 无效：请填写你自己注册的 Azure 应用 client_id")
-                  (say "  ✘ client_id 无效 (unauthorized_client)")
-                  (say "     请到「账户登录」页填写你自己注册的 Azure Application (client) ID"))
-                (begin
-                  (write-auth-status (str "error|" ed))
-                  (say (str "  ✘ " ed))))
-            0)
-        (begin
-          (say (str "  请在浏览器打开: " veri-uri))
-          (say (str "  输入代码: " user-code))
-          (write-auth-status (str "pending|" user-code "|" veri-uri))
-          (proc-run "cmd" (list "/c" "start" "" (str "\"" veri-uri "\"")))
-          (define got nil) (define tries 0)
-          (while (and (null? got) (< tries 60))
-            (begin
-              (set! tries (+ tries 1))
-              (sleep 5000)
-              (set! got (http-post (str "https://login.microsoftonline.com/" MS_TENANT "/oauth2/v2.0/token")
-                                   (str "grant_type=urn:ietf:params:oauth:grant-type:device_code&client_id=" MS_CLIENT_ID "&device_code=" dev-code) "application/x-www-form-urlencoded"))
-              (if (and (not (null? got)) (null? (jget got "error"))) 0 (set! got nil))))
-          (if (null? got)
-              (begin (write-auth-status "error|登录超时或被取消(请在浏览器完成登录)") (say "  ✘ 轮询超时") 0)
-              (ms-finish got))))))))
+      (if (or (equal? user-code "") (equal? veri-uri "") (equal? dev-code ""))
+          (let* ((err (jstr dc "error"))
+                 (desc (jstr dc "error_description"))
+                 (hint (ms-oauth-error err desc)))
+            (begin (write-auth-status (str "error|" hint)) (say (str "  ✘ " hint)) 0))
+        (let* ((iv (jget dc "interval"))
+               (ei (jget dc "expires_in"))
+               (iv0 (if (number? iv) iv 5))
+               (interval (if (< iv0 5) 5 iv0))
+               (expires-in (if (number? ei) (if (> ei 300) 300 ei) 300)))
+          (begin
+            (say (str "  请在浏览器打开: " veri-uri))
+            (say (str "  输入代码: " user-code " (已复制到剪贴板)"))
+            (write-auth-status (str "pending|" user-code "|" veri-uri))
+            (proc-run "powershell" (list "-NoProfile" "-Command"
+                        (str "Set-Clipboard -Value '" user-code "'")))
+            (proc-run "cmd" (list "/c" "start" "" (str "\"" veri-uri "\"")))
+            (let ((resp (ms-poll-token dev-code interval expires-in)))
+              (if (null? resp)
+                  (begin (write-auth-status "error|登录超时, 请重新点一次登录")
+                         (say "  ✘ 轮询结束") 0)
+                  (ms-finish resp ""))))))))))
+
+;; ---- OAuth 2.0 refresh_token 静默续期(不开浏览器) ----
+;; accounts.txt 一直存着 refresh token, 旧版却从没用过, 每次都得重走设备码流。
+(define (ms-refresh-flow)
+  (say "=== 微软登录刷新 (OAuth2 refresh_token) ===")
+  (define acct (get-current-account))
+  (if (or (null? acct) (not (equal? (get acct 0) "microsoft")))
+      (begin (write-auth-status "error|当前账户不是微软账户, 请先登录一次") 0)
+    (let ((old-ref (get acct 4)))
+      (if (or (null? old-ref) (equal? old-ref ""))
+          (begin (write-auth-status "error|该账户没有 refresh token, 请重新登录一次") 0)
+        (let ((resp (http-post-form MS_TOKEN_URL
+                      (list "grant_type=refresh_token"
+                            (str "client_id=" MS_CLIENT_ID)
+                            (str "refresh_token=" old-ref)
+                            (str "scope=" MS_SCOPE_RAW)))))
+          (if (or (null? resp) (string? resp))
+              (begin (write-auth-status "error|刷新请求失败(网络/证书)") 0)
+            (let* ((err (jstr resp "error"))
+                   (desc (jstr resp "error_description")))
+              (if (not (equal? err ""))
+                  (begin (write-auth-status (str "error|" (ms-oauth-error err desc)))
+                         (say (str "  ✘ 刷新失败: " err)) 0)
+                (begin (say "  ✓ 令牌已刷新, 正在重建游戏会话")
+                       (ms-finish resp old-ref))))))))))
 
 ;; ---- LittleSkin 登录 (Yggdrasil 外置登录) ----
 (define (littleskin-login-flow)
@@ -1050,6 +1149,7 @@
   (if (not (null? MODE))
       (if (equal? MODE "auth-ms") (ms-login-flow)
         (if (equal? MODE "auth-littleskin") (littleskin-login-flow)
-          (run)))
+          (if (equal? MODE "auth-refresh") (ms-refresh-flow)
+            (run))))
       (run)))
 (auth-dispatch)

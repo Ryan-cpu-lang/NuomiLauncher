@@ -54,7 +54,9 @@
 ;; ⚠️ 标签文字(scale1)高约 16px, 标签 y 到输入框 y 必须留 >= 18px,
 ;;    否则输入框色块会盖住标签下半截(旧版只差 8px, 截图里就是这样)。
 (define AC_CARD_X MAIN_X) (define AC_CARD_Y 120) (define AC_CARD_W MAIN_W) (define AC_CARD_H 44)
-(define MS_X MAIN_X) (define MS_Y 172) (define MS_W MAIN_W) (define MS_H 38)
+(define MS_X MAIN_X) (define MS_Y 172) (define MS_W 264) (define MS_H 38)
+;; 同一行右侧放「刷新」(OAuth2 refresh_token 静默续期), 264 + 8 + 72 = MAIN_W
+(define MS_REFRESH_X (+ MAIN_X 272)) (define MS_REFRESH_W 72)
 (define CID_X MAIN_X) (define CID_LABEL_Y 218) (define CID_Y 238) (define CID_W 264) (define CID_H 32)
 (define CID_SAVE_X (+ MAIN_X 272)) (define CID_SAVE_Y CID_Y) (define CID_SAVE_W 72) (define CID_SAVE_H CID_H)
 (define LSU_X MAIN_X) (define LSU_LABEL_Y 276) (define LSU_Y 296) (define LSU_W MAIN_W) (define LSU_H 32)
@@ -87,6 +89,9 @@
 
 ;; ---- 账户 / 登录 ----
 (define ACCOUNTS_DIR (str (getenv "USERPROFILE") "/.nuomi-mc"))
+;; 首次运行目录还不存在, Nuomi 的 write-file 不自动建父目录 ->
+;; 不先建目录的话登录状态写不出去, 界面会永远停在「正在连接登录服务」。
+(if (not (is-dir? ACCOUNTS_DIR)) (mkdir ACCOUNTS_DIR) 0)
 (define ACCOUNTS_FILE (str ACCOUNTS_DIR "/accounts.txt"))
 (define CURRENT_FILE  (str ACCOUNTS_DIR "/account_current.txt"))
 (define AUTH_RES      (str ACCOUNTS_DIR "/.auth_result.txt"))
@@ -371,6 +376,10 @@
   (window-text ui (center-x MS_X MS_W (if auth-busy "等待浏览器完成" "使用微软账号登录"))
                 (+ MS_Y 11) 1 (if auth-busy "等待浏览器完成" "使用微软账号登录")
                 (if auth-busy DIM WHITE))
+  ;; 右侧「刷新」: 用保存的 refresh token 静默续期, 不开浏览器
+  (window-shape ui 6 MS_REFRESH_X MS_Y MS_REFRESH_W MS_H (if auth-busy BTN_DIS PANEL) 10)
+  (window-text ui (center-x MS_REFRESH_X MS_REFRESH_W "刷新") (+ MS_Y 11) 1 "刷新"
+                (if auth-busy DIM2 ACCENT))
   ;; 微软 Client ID 标签 + 输入框 + 保存
   (window-text ui CID_X CID_LABEL_Y 1 "微软 Client ID（Azure 应用）" DIM)
   (draw-input ui CID_X CID_Y CID_W CID_H (equal? focus2 "cid") "粘贴你自己的 Client ID" ms-cid)
@@ -437,11 +446,11 @@
         "&& start /min " LAUNCH_DIR "\\nuomi.exe launcher.nuomi"))))
 
 ;; ---------- 触发登录流程(独立进程) ----------
-;; mode: "auth-ms" | "auth-littleskin"
+;; mode: "auth-ms" | "auth-littleskin" | "auth-refresh"
 (define (spawn-auth mode)
   (set! auth-busy true)
   (set! auth-state "pending")
-  (set! auth-msg "正在连接登录服务")
+  (set! auth-msg (if (equal? mode "auth-refresh") "正在静默刷新令牌" "正在连接登录服务"))
   (write-file AUTH_RES "")
   (proc-run "cmd" (list "/c"
     (str "set NUOMI_MODE=" mode
@@ -544,8 +553,12 @@
                       (if (equal? nav "account")
                           (begin
                             ;; 微软登录
-                            (if (in-rect cx cy MS_X MS_Y MS_W MS_H)
-                                (if (not auth-busy) (spawn-auth "auth-ms") 0)
+                            (if (in-rect cx cy MS_X MS_Y MAIN_W MS_H)
+                                (if (not auth-busy)
+                                    (if (in-rect cx cy MS_REFRESH_X MS_Y MS_REFRESH_W MS_H)
+                                        (spawn-auth "auth-refresh")
+                                        (spawn-auth "auth-ms"))
+                                    0)
                                 ;; 微软 client_id 输入框 + 保存按钮
                                 (if (in-rect cx cy CID_X CID_Y CID_W CID_H)
                                     (if (not auth-busy) (begin (set! focus2 "cid") (set! auth-msg "")) 0)
