@@ -1,42 +1,66 @@
-;; gui.nuomi - Nuomi 启动器图形界面
+;; gui.nuomi - Nuomi 启动器图形界面 (PCL 风格: 左侧导航 + 右侧圆角卡片)
 ;; 由 nuomi.cmd 的 MC-gui / 桌面 NuomiMC-GUI.bat 触发；cwd 应为 launcher 目录
 ;; 依赖窗口原语: window-create/fill/shape/text/clear/invalidate/close/event/click/char
 ;;
-;; 说明: GUI 只负责「选 + 点 + 输名字 + 选目录」, 真正的下载/启动交给 launcher.nuomi(CLI 模式),
-;;       通过 cmd /c start 异步拉起, 避免阻塞 GUI 消息泵。进度经 NUOMI_PROGRESS_FILE 回传轮询。
+;; 说明: GUI 只负责「选 + 点 + 输名字 + 选目录 + 登录」, 真正的下载/启动/登录交给
+;;       launcher.nuomi(CLI 模式), 通过 cmd /c start 异步拉起, 避免阻塞 GUI 消息泵。
+;;       下载进度经 NUOMI_PROGRESS_FILE 回传轮询; 登录状态经 .auth_result.txt 回传轮询。
 
 ;; 语法自检开关
 (define IS_TEST (not (null? (getenv "NUOMI_GUI_TEST"))))
 
-;; ---------- 配色 ----------
-(define WIN_W 480)
-(define WIN_H 440)
+;; ---------- 配色 (PCL 风: 近黑底 + 靛蓝紫强调) ----------
+(define WIN_W 560)
+(define WIN_H 560)
 (define (rgb r g b) (+ (* r 65536) (* g 256) b))
-(define BG      (rgb 20 22 26))
-(define PANEL   (rgb 30 33 40))
-(define ACCENT  (rgb 76 154 255))
-(define BTN     (rgb 58 123 213))
-(define BTN_DIS (rgb 44 49 58))
-(define TEXT    (rgb 230 230 230))
-(define DIM     (rgb 138 143 152))
-(define GREEN   (rgb 87 199 94))
-(define WHITE   (rgb 255 255 255))
-(define CARD    (rgb 26 29 35))
-(define SEPLINE (rgb 40 44 52))
-(define LOGO    (rgb 124 92 255))
+(define BG       (rgb 17 19 23))     ;; 主区背景(近黑)
+(define SIDEBAR  (rgb 22 24 30))     ;; 侧栏(略深)
+(define PANEL    (rgb 30 33 40))
+(define ACCENT   (rgb 88 101 242))   ;; 主强调(靛蓝)
+(define ACCENT_HI(rgb 112 126 255))  ;; 确认态(更亮)
+(define LOGO     (rgb 124 92 255))   ;; logo 紫
+(define BTN_DIS  (rgb 40 44 54))
+(define TEXT     (rgb 232 233 238))
+(define DIM      (rgb 140 146 156))
+(define DIM2     (rgb 110 116 128))   ;; 禁用态按钮文字(比 DIM 暗但可读)
+(define GREEN    (rgb 86 196 96))
+(define RED      (rgb 226 96 96))
+(define WHITE    (rgb 255 255 255))
+(define CARD     (rgb 26 29 36))
+(define SEPLINE  (rgb 38 42 50))
+(define INPUT_BG (rgb 13 15 19))     ;; 输入框内底
 
 ;; ---------- 几何 ----------
+(define SB_W 160)                    ;; 侧栏宽
+(define MAIN_X (+ SB_W 28))          ;; 主区起始 x (=188)
+(define MAIN_W (- WIN_W MAIN_X 28))  ;; 主区宽 (=344)
 ;; 玩家名
-(define NAME_X 40) (define NAME_Y 82) (define NAME_W 400) (define NAME_H 32)
+(define NAME_X MAIN_X) (define NAME_Y 150) (define NAME_W MAIN_W) (define NAME_H 36)
 ;; 游戏目录
-(define PATH_X 40) (define PATH_Y 144) (define PATH_W 400) (define PATH_H 32)
-;; 按钮
-(define BTN_W 180) (define BTN_H 46) (define B1X 40) (define B2X 260) (define BTN_Y 206)
+(define PATH_X MAIN_X) (define PATH_Y 224) (define PATH_W 280) (define PATH_H 36)
+;; 浏览按钮(紧贴目录框右侧, 免手输路径)
+(define BROWSE_X (+ PATH_X PATH_W 8)) (define BROWSE_Y PATH_Y) (define BROWSE_W 56) (define BROWSE_H PATH_H)
+;; 主按钮(大圆角)
+(define MB_X MAIN_X) (define MB_Y 300) (define MB_W MAIN_W) (define MB_H 56)
 ;; 状态卡
-(define CARD_X 24) (define CARD_Y 280) (define CARD_W 432) (define CARD_H 72)
-(define STATUS_X 40) (define STATUS_Y 300)
+(define CARD_X MAIN_X) (define CARD_Y 380) (define CARD_W MAIN_W) (define CARD_H 44)
 ;; 进度条
-(define BAR_X 40) (define BAR_Y 384) (define BAR_W 400) (define BAR_H 16)
+(define BAR_X MAIN_X) (define BAR_Y 440) (define BAR_W MAIN_W) (define BAR_H 14)
+;; 侧栏导航
+(define NAV_X 16) (define NAV_W (- SB_W 32)) (define NAV_H 44)
+(define NAV1_Y 96) (define NAV2_Y 152) (define NAV3_Y 208)
+
+;; ---- 账户页几何 ----
+;; ⚠️ 标签文字(scale1)高约 16px, 标签 y 到输入框 y 必须留 >= 18px,
+;;    否则输入框色块会盖住标签下半截(旧版只差 8px, 截图里就是这样)。
+(define AC_CARD_X MAIN_X) (define AC_CARD_Y 120) (define AC_CARD_W MAIN_W) (define AC_CARD_H 44)
+(define MS_X MAIN_X) (define MS_Y 172) (define MS_W MAIN_W) (define MS_H 38)
+(define CID_X MAIN_X) (define CID_LABEL_Y 218) (define CID_Y 238) (define CID_W 264) (define CID_H 32)
+(define CID_SAVE_X (+ MAIN_X 272)) (define CID_SAVE_Y CID_Y) (define CID_SAVE_W 72) (define CID_SAVE_H CID_H)
+(define LSU_X MAIN_X) (define LSU_LABEL_Y 276) (define LSU_Y 296) (define LSU_W MAIN_W) (define LSU_H 32)
+(define LSW_X MAIN_X) (define LSW_LABEL_Y 334) (define LSW_Y 354) (define LSW_W MAIN_W) (define LSW_H 32)
+(define LSB_X MAIN_X) (define LSB_Y 394) (define LSB_W MAIN_W) (define LSB_H 34)
+(define AC_TITLE_Y 434) (define AC_LIST_Y 452) (define AC_ITEM_H 20) (define AC_MAX 4)
 
 ;; ---------- 状态 ----------
 (define USERNAME (let ((u (getenv "NUOMI_USERNAME")))
@@ -44,78 +68,364 @@
 (define GAME_DIR (let ((d (getenv "NUOMI_GAME_DIR")))
                    (if (or (null? d) (equal? d "")) (str (getenv "USERPROFILE") "/.nuomi-mc") d)))
 (define VERSION "1.21.4")
-(define status-msg "点按钮开始 · 需再点一次确认")
+(define status-msg "从左侧选择操作 / 按钮需再点一次确认")
 (define pstage "") (define pcur 0) (define ptotal 0) (define busy false)
 (define focus "name")        ;; "name" | "path" | ""
-(define pending "")          ;; "" | "launch" | "download"
+(define nav "launch")        ;; "launch" | "download" | "account"
+(define pending "")          ;; "" | "launch" | "download" (二次确认)
 (define done false)
 (define frame 0)
 (define PROG (str (getenv "USERPROFILE") "/.nuomi-mc/gui_progress.txt"))
 (define LAUNCH_DIR (let ((d (getenv "NUOMI_LAUNCHER_DIR")))
                      (if (or (null? d) (equal? d "")) "." d)))
+;; 浏览文件夹用的临时文件(走系统 TEMP, 路径为 ASCII, 规避中文编码问题)
+(define BROWSE_DIR (let ((t (getenv "TEMP")))
+                     (if (or (null? t) (equal? t "")) (getenv "USERPROFILE") t)))
+(define BROWSE_INIT (str BROWSE_DIR "/nuomi_browse_in.txt"))
+(define BROWSE_OUT  (str BROWSE_DIR "/nuomi_browse_out.txt"))
+(define BROWSE_PS   (str BROWSE_DIR "/nuomi_browse.ps1"))
+
+;; ---- 账户 / 登录 ----
+(define ACCOUNTS_DIR (str (getenv "USERPROFILE") "/.nuomi-mc"))
+(define ACCOUNTS_FILE (str ACCOUNTS_DIR "/accounts.txt"))
+(define CURRENT_FILE  (str ACCOUNTS_DIR "/account_current.txt"))
+(define AUTH_RES      (str ACCOUNTS_DIR "/.auth_result.txt"))
+(define LS_CRED       (str ACCOUNTS_DIR "/._ls_cred.txt"))
+(define CID_FILE      (str ACCOUNTS_DIR "/ms_client_id.txt"))
+(define accs nil)          ;; 已存账户: 每项 (type name uuid ...)
+(define cur-uuid "")       ;; 当前账户 uuid
+(define ls-user "")        ;; LittleSkin 用户名输入
+(define ls-pass "")        ;; LittleSkin 密码输入
+(define ms-cid "")         ;; 微软 client_id 输入
+(define focus2 "")         ;; 账户页焦点: "lsu" | "lsw" | "cid" | ""
+(define auth-msg "")       ;; 登录状态提示
+(define auth-state "")     ;; "" | "pending" | "ok" | "error"
+(define auth-busy false)   ;; 正在等待登录结果
 
 ;; ---------- 命中测试 ----------
 (define (in-rect x y rx ry rw rh)
   (and (>= x rx) (<= x (+ rx rw)) (>= y ry) (<= y (+ ry rh))))
 
-;; ---------- 绘图 ----------
+;; 文字宽度估算做居中用。
+;; ⚠️ length 是【字节数】: 中文 3 字节但只占约 16px, ASCII 1 字节约 8px。
+;;    旧版用 (* (length s) 8) 会把中文高估 1.5 倍, 按钮文字明显偏左;
+;;    取 6px/字节折中(纯中文 18px/字≈实际16px, 纯 ASCII 6px≈实际8px)。
+(define (labelw s) (* (length s) 6))
+(define (center-x rx rw s) (+ rx (/ (- rw (labelw s)) 2)))
+
+;; ---------- 小工具 ----------
+;; 密码掩码: 生成与原文等长的 ******
+(define (mask s)
+  (define n (length s))
+  (define out "")
+  (define i 0)
+  (while (< i n) (begin (set! out (str out "*")) (set! i (+ i 1))))
+  out)
+;; 截断显示(uuid 只显示前 8 位)
+(define (head8 s)
+  (if (> (length s) 8) (str (substring s 0 8) "") s))
+;; 账户类型 -> 中文标签
+(define (type-label t)
+  (if (equal? t "microsoft") "微软正版"
+    (if (equal? t "littleskin") "LittleSkin" "离线")))
+;; 账户类型 -> 标签颜色
+(define (type-color t)
+  (if (equal? t "microsoft") ACCENT
+    (if (equal? t "littleskin") LOGO DIM)))
+
+;; ⚠️ Nuomi 的 length/substring 是【字节语义】: 中文 UTF-8 占 3 字节,
+;;    用 substring 按固定字节数折行会把汉字从中间劈开 -> 乱码("号"/"会自动使用该耀")。
+;;    因此折行一律走 str-split(按 ASCII 空格切, 中文 UTF-8 字节绝不误匹配),
+;;    断行点只落在完整词/标点边界, 绝不用 substring 切字符串。
+;; 在中文标点后补一个空格, 制造安全的断行位置
+(define (add-breaks s)
+  (str-replace
+    (str-replace
+      (str-replace
+        (str-replace s "：" "： ") "，" "， ")
+      "。" "。 ")
+    "；" "； "))
+
+;; 单行最大字节数(约 6px/字节, 主区宽 344px, 留余量)
+(define MSG_MAX_BYTES 54)
+
+;; 多行提示(标题下方): 错误红 / 成功绿 / 默认灰
+;; 按词折行, 最多 2 行, 既不乱码也不压到下方卡片
+(define (draw-msg ui x y)
+  (define color (if (equal? auth-state "error") RED (if (equal? auth-state "ok") GREEN DIM)))
+  (define txt (if (equal? auth-msg "") "登录后启动游戏会自动使用该账号" auth-msg))
+  (define words (str-split (add-breaks txt) " "))
+  (define cur "")
+  (define line 0)
+  (define i 0)
+  (while (and (< i (length words)) (< line 2))
+    (begin
+      (let ((w (get words i)))
+        (if (equal? w "") 0
+            (if (equal? cur "")
+                (set! cur w)
+                (if (> (+ (length cur) (length w) 1) MSG_MAX_BYTES)
+                    (begin
+                      (window-text ui x (+ y (* line 16)) 1 cur color)
+                      (set! line (+ line 1))
+                      (set! cur w))
+                    (set! cur (str cur " " w))))))
+      (set! i (+ i 1))))
+  (if (and (< line 2) (not (equal? cur "")))
+      (window-text ui x (+ y (* line 16)) 1 cur color)
+      0))
+
+;; 通用输入框(圆角 + 内底 + 聚焦高亮 + 闪烁光标)
+(define (draw-input ui x y w h active placeholder value)
+  (window-shape ui 6 x y w h (if active ACCENT BTN_DIS) 10)
+  (window-shape ui 6 (+ x 2) (+ y 2) (- w 4) (- h 4) INPUT_BG 8)
+  (if (equal? value "")
+      (window-text ui (+ x 12) (+ y 8) 1 placeholder DIM)
+      (window-text ui (+ x 12) (+ y 8) 1 value TEXT))
+  (if (and active (< (% frame 40) 20))
+      (window-shape ui 1 (+ x 12 (* (length value) 8)) (+ y 7) 2 (- h 14) TEXT) 0))
+
+;; ---------- 账户读写 ----------
+;; 读取 accounts.txt, 每行: type \t name \t uuid \t token \t extra1 \t extra2 \t expires
+(define (reload-accts)
+  (set! accs nil)
+  (if (exists? ACCOUNTS_FILE)
+    (let ((raw (read-file ACCOUNTS_FILE)))
+      (let ((lines (str-split (str-replace raw "\r" "") "\n")))
+        (let ((i 0))
+          (while (< i (length lines))
+            (let ((ln (get lines i)))
+              (set! i (+ i 1))
+              (if (equal? ln "") 0
+                (let ((f (str-split ln "\t")))
+                  (if (>= (length f) 3)
+                      (set! accs (cons (list (get f 0) (get f 1) (get f 2)) accs))
+                      0)))))
+        0)))
+    0)
+  ;; 当前账户 uuid
+  (set! cur-uuid "")
+  (if (exists? CURRENT_FILE)
+    (set! cur-uuid (str-replace (str-replace (read-file CURRENT_FILE) "\r" "") "\n" ""))
+    0)
+  accs)
+
+;; 读取已保存的微软 client_id
+(define (reload-cid)
+  (set! ms-cid "")
+  (if (exists? CID_FILE)
+      (set! ms-cid (str-replace (str-replace (read-file CID_FILE) "\r" "") "\n" ""))
+      0)
+  ms-cid)
+
+;; 保存微软 client_id
+(define (save-cid)
+  (write-file CID_FILE ms-cid)
+  (set! auth-msg (if (equal? ms-cid "") "已清空 client_id" "client_id 已保存，下次登录生效"))
+  (set! focus2 "")
+  0)
+
+;; 按 uuid 查找账户条目
+(define (find-acct uuid)
+  (define r nil)
+  (if (not (null? accs))
+      (let ((i 0))
+        (while (< i (length accs))
+          (if (equal? (get (get accs i) 2) uuid) (set! r (get accs i)) 0)
+          (set! i (+ i 1))))
+      0)
+  r)
+
+;; 切换当前账户
+(define (switch-acct uuid)
+  (write-file CURRENT_FILE uuid)
+  (set! cur-uuid uuid)
+  (set! auth-msg "已切换账户")
+  0)
+
+;; ---------- 绘图: 侧栏 ----------
+(define (draw-sidebar ui)
+  (window-fill ui 0 0 SB_W WIN_H SIDEBAR)
+  (window-shape ui 1 SB_W 0 1 WIN_H SEPLINE)        ;; 右分隔线
+  ;; logo
+  (window-shape ui 5 20 24 44 44 LOGO 0)          ;; 圆形 logo 底
+  (window-text ui 38 40 2 "N" WHITE)
+  (window-text ui 76 38 1 "Nuomi" WHITE)
+  (window-text ui 76 56 1 "Launcher" DIM)
+  ;; 导航项 1: 启动游戏
+  (if (equal? nav "launch")
+      (begin (window-shape ui 6 NAV_X NAV1_Y NAV_W NAV_H ACCENT 10)
+             (window-shape ui 1 (+ NAV_X 1) (+ NAV1_Y 10) 3 (- NAV_H 20) WHITE 0)
+             (window-shape ui 5 (+ NAV_X 16) (+ NAV1_Y 12) 20 20 WHITE 0)
+             (window-text ui (+ NAV_X 46) (+ NAV1_Y 15) 1 "启动游戏" WHITE))
+      (begin (window-shape ui 7 NAV_X NAV1_Y NAV_W NAV_H SEPLINE 10)
+             (window-shape ui 5 (+ NAV_X 16) (+ NAV1_Y 12) 20 20 DIM 0)
+             (window-text ui (+ NAV_X 46) (+ NAV1_Y 15) 1 "启动游戏" DIM)))
+  ;; 导航项 2: 下载资源
+  (if (equal? nav "download")
+      (begin (window-shape ui 6 NAV_X NAV2_Y NAV_W NAV_H ACCENT 10)
+             (window-shape ui 1 (+ NAV_X 1) (+ NAV2_Y 10) 3 (- NAV_H 20) WHITE 0)
+             (window-shape ui 5 (+ NAV_X 16) (+ NAV2_Y 12) 20 20 WHITE 0)
+             (window-text ui (+ NAV_X 46) (+ NAV2_Y 15) 1 "下载资源" WHITE))
+      (begin (window-shape ui 7 NAV_X NAV2_Y NAV_W NAV_H SEPLINE 10)
+             (window-shape ui 5 (+ NAV_X 16) (+ NAV2_Y 12) 20 20 DIM 0)
+             (window-text ui (+ NAV_X 46) (+ NAV2_Y 15) 1 "下载资源" DIM)))
+  ;; 导航项 3: 账户登录
+  (if (equal? nav "account")
+      (begin (window-shape ui 6 NAV_X NAV3_Y NAV_W NAV_H ACCENT 10)
+             (window-shape ui 1 (+ NAV_X 1) (+ NAV3_Y 10) 3 (- NAV_H 20) WHITE 0)
+             (window-shape ui 5 (+ NAV_X 16) (+ NAV3_Y 12) 20 20 WHITE 0)
+             (window-text ui (+ NAV_X 46) (+ NAV3_Y 15) 1 "账户登录" WHITE))
+      (begin (window-shape ui 7 NAV_X NAV3_Y NAV_W NAV_H SEPLINE 10)
+             (window-shape ui 5 (+ NAV_X 16) (+ NAV3_Y 12) 20 20 DIM 0)
+             (window-text ui (+ NAV_X 46) (+ NAV3_Y 15) 1 "账户登录" DIM)))
+  ;; 版本号(侧栏底部)
+  (window-text ui 20 (- WIN_H 30) 1 (str "v" VERSION) DIM)
+  (window-text ui 20 (- WIN_H 14) 1 "开源 / 离线优先" DIM))
+
+;; ---------- 绘图: 启动/下载页 ----------
+(define (draw-launch ui)
+  ;; 大标题 + 副标题
+  (window-text ui MAIN_X 44 2 (if (equal? nav "launch") "启动游戏" "下载资源") WHITE)
+  (window-text ui MAIN_X 78 1
+    (if (equal? nav "launch") "设置玩家与路径后点击启动" "下载游戏资源到本地目录") DIM)
+  (window-shape ui 1 MAIN_X 96 MAIN_W 1 SEPLINE 0)   ;; 标题下方分隔线
+  ;; 玩家名
+  (window-text ui NAME_X 130 1 "玩家名" DIM)
+  (window-shape ui 6 NAME_X NAME_Y NAME_W NAME_H (if (equal? focus "name") ACCENT BTN_DIS) 8)
+  (window-shape ui 6 (+ NAME_X 2) (+ NAME_Y 2) (- NAME_W 4) (- NAME_H 4) INPUT_BG 6)
+  (if (equal? USERNAME "")
+      (window-text ui (+ NAME_X 12) (+ NAME_Y 10) 1 "输入玩家名" DIM)
+      (window-text ui (+ NAME_X 12) (+ NAME_Y 10) 1 USERNAME TEXT))
+  (if (and (equal? focus "name") (< (% frame 40) 20) (not busy))
+      (window-shape ui 1 (+ NAME_X 12 (* (length USERNAME) 8)) (+ NAME_Y 7) 2 (- NAME_H 14) TEXT) 0)
+  ;; 游戏目录
+  (window-text ui PATH_X 204 1 "游戏目录" DIM)
+  (window-shape ui 6 PATH_X PATH_Y PATH_W PATH_H (if (equal? focus "path") ACCENT BTN_DIS) 8)
+  (window-shape ui 6 (+ PATH_X 2) (+ PATH_Y 2) (- PATH_W 4) (- PATH_H 4) INPUT_BG 6)
+  (if (equal? GAME_DIR "")
+      (window-text ui (+ PATH_X 12) (+ PATH_Y 10) 1 "输入游戏目录" DIM)
+      (window-text ui (+ PATH_X 12) (+ PATH_Y 10) 1 GAME_DIR TEXT))
+  (if (and (equal? focus "path") (< (% frame 40) 20) (not busy))
+      (window-shape ui 1 (+ PATH_X 12 (* (length GAME_DIR) 7)) (+ PATH_Y 7) 2 (- PATH_H 14) TEXT) 0)
+  ;; 浏览按钮(选目录, 免手输)
+  (window-shape ui 6 BROWSE_X BROWSE_Y BROWSE_W BROWSE_H (if busy BTN_DIS PANEL) 8)
+  (window-text ui (center-x BROWSE_X BROWSE_W "浏览") (+ BROWSE_Y 11) 1 "浏览"
+                (if busy DIM ACCENT))
+  ;; 主按钮(大圆角, 待确认时高亮)
+  (window-shape ui 6 MB_X MB_Y MB_W MB_H
+    (if busy BTN_DIS (if (equal? pending nav) ACCENT_HI ACCENT)) 12)
+  ;; 顶部高光(细圆角条, 模拟按钮光泽)
+  (if (not busy)
+      (window-shape ui 6 (+ MB_X 10) (+ MB_Y 5) (- MB_W 20) 7
+        (if (equal? pending nav) WHITE ACCENT_HI) 4) 0)
+  (window-text ui (center-x MB_X MB_W (if (equal? nav "launch")
+                                          (if (equal? pending "launch") "确认启动?" "启动游戏")
+                                          (if (equal? pending "download") "确认下载?" "下载资源")))
+                (+ MB_Y 20) 1
+                (if (equal? nav "launch")
+                    (if (equal? pending "launch") "确认启动?" "启动游戏")
+                    (if (equal? pending "download") "确认下载?" "下载资源"))
+                WHITE)
+  ;; 状态卡
+  (window-shape ui 6 CARD_X CARD_Y CARD_W CARD_H CARD 8)
+  (window-shape ui 1 CARD_X CARD_Y 4 CARD_H ACCENT 0)
+  (window-text ui (+ CARD_X 18) (+ CARD_Y 14) 1 status-msg TEXT)
+  ;; 进度条
+  (window-shape ui 6 BAR_X BAR_Y BAR_W BAR_H BTN_DIS 7)
+  (if (> ptotal 0)
+      (let ((pw (floor (/ (* BAR_W pcur) ptotal)))
+            (sl (if (equal? pstage "launch") "启动"
+                    (if (equal? pstage "download") "下载" pstage)))
+            (pct (str (floor (/ (* 100 pcur) ptotal)) "%")))
+        (if (> pw 0) (window-shape ui 6 BAR_X BAR_Y pw BAR_H GREEN 7) 0)
+        (window-text ui (+ BAR_X 8) (+ BAR_Y 1) 1 (str sl "  " pcur "/" ptotal) WHITE)
+        (window-text ui (- (+ BAR_X BAR_W) 8 (* (length pct) 8)) (+ BAR_Y 1) 1 pct WHITE))
+      0))
+
+;; ---------- 绘图: 账户登录页 ----------
+(define (draw-account ui)
+  (define ls-ready (and (not auth-busy) (not (equal? ls-user "")) (not (equal? ls-pass ""))))
+  ;; 标题
+  (window-text ui MAIN_X 40 2 "账户登录" WHITE)
+  (draw-msg ui MAIN_X 76)
+  (window-shape ui 1 MAIN_X 112 MAIN_W 1 SEPLINE 0)
+  ;; 当前账户卡(44 高, 只放得下两行)
+  (window-shape ui 6 AC_CARD_X AC_CARD_Y AC_CARD_W AC_CARD_H CARD 10)
+  (window-shape ui 1 AC_CARD_X AC_CARD_Y 4 AC_CARD_H ACCENT 0)
+  (if (equal? cur-uuid "")
+      (window-text ui (+ AC_CARD_X 18) (+ AC_CARD_Y 14) 1 "当前：离线模式（启动页填写玩家名）" DIM)
+      (begin
+        (let ((cur (find-acct cur-uuid)))
+          (if (null? cur)
+              (window-text ui (+ AC_CARD_X 18) (+ AC_CARD_Y 14) 1 "未知账户" TEXT)
+              (begin
+                (window-text ui (+ AC_CARD_X 18) (+ AC_CARD_Y 7) 1 (get cur 1) TEXT)
+                (window-text ui (+ AC_CARD_X 18) (+ AC_CARD_Y 25) 1
+                  (str (type-label (get cur 0)) " / " (head8 (get cur 2)))
+                  (type-color (get cur 0))))))))
+  ;; 微软登录按钮(主操作, 大且醒目, 带顶部高光)
+  (window-shape ui 6 MS_X MS_Y MS_W MS_H (if auth-busy BTN_DIS ACCENT) 10)
+  (if (not auth-busy)
+      (window-shape ui 6 (+ MS_X 12) (+ MS_Y 6) (- MS_W 24) 6 ACCENT_HI 3) 0)
+  (window-text ui (center-x MS_X MS_W (if auth-busy "等待浏览器完成" "使用微软账号登录"))
+                (+ MS_Y 11) 1 (if auth-busy "等待浏览器完成" "使用微软账号登录")
+                (if auth-busy DIM WHITE))
+  ;; 微软 Client ID 标签 + 输入框 + 保存
+  (window-text ui CID_X CID_LABEL_Y 1 "微软 Client ID（Azure 应用）" DIM)
+  (draw-input ui CID_X CID_Y CID_W CID_H (equal? focus2 "cid") "粘贴你自己的 Client ID" ms-cid)
+  (window-shape ui 6 CID_SAVE_X CID_SAVE_Y CID_SAVE_W CID_SAVE_H (if (equal? focus2 "cid") ACCENT PANEL) 10)
+  (window-text ui (center-x CID_SAVE_X CID_SAVE_W "保存") (+ CID_SAVE_Y 9) 1 "保存"
+                (if (equal? focus2 "cid") WHITE ACCENT))
+  ;; LittleSkin 用户名
+  (window-text ui LSU_X LSU_LABEL_Y 1 "LittleSkin 用户名" DIM)
+  (draw-input ui LSU_X LSU_Y LSU_W LSU_H (equal? focus2 "lsu") "你的 LittleSkin 角色名" ls-user)
+  ;; LittleSkin 密码(掩码)
+  (window-text ui LSW_X LSW_LABEL_Y 1 "LittleSkin 密码" DIM)
+  (draw-input ui LSW_X LSW_Y LSW_W LSW_H (equal? focus2 "lsw") "密码（不会保存）"
+              (if (equal? ls-pass "") "" (mask ls-pass)))
+  ;; LittleSkin 登录按钮(禁用态可读)
+  (window-shape ui 6 LSB_X LSB_Y LSB_W LSB_H (if ls-ready ACCENT BTN_DIS) 10)
+  (window-text ui (center-x LSB_X LSB_W "登录 LittleSkin") (+ LSB_Y 10) 1 "登录 LittleSkin"
+                (if ls-ready WHITE DIM2))
+  ;; 已登录账户
+  (window-text ui MAIN_X AC_TITLE_Y 1 "已登录账户（点击切换）" DIM)
+  (if (null? accs)
+      (window-text ui MAIN_X (+ AC_TITLE_Y 18) 1 "暂无已登录账户" DIM)
+      (let ((i 0))
+        (while (< i (length accs))
+          (let ((a (get accs i)))
+            (if (< i AC_MAX)
+                (let ((y (+ AC_LIST_Y (* i AC_ITEM_H)))
+                      (sel (equal? (get a 2) cur-uuid)))
+                  (if sel (window-shape ui 6 MAIN_X y MAIN_W (- AC_ITEM_H 4) ACCENT 6) 0)
+                  (window-text ui (+ MAIN_X 12) (+ y 3) 1 (get a 1) (if sel WHITE TEXT))
+                  (window-text ui (+ MAIN_X 150) (+ y 3) 1 (type-label (get a 0))
+                    (if sel WHITE (type-color (get a 0))))
+                  (window-text ui (+ MAIN_X 230) (+ y 3) 1 (head8 (get a 2))
+                    (if sel WHITE DIM)))
+                0))
+          (set! i (+ i 1)))))
+  ;; 超过 4 个时提示
+  (if (and (not (null? accs)) (> (length accs) AC_MAX))
+      (window-text ui MAIN_X (+ AC_LIST_Y (* AC_MAX AC_ITEM_H) 2) 1
+        (str "还有 " (- (length accs) AC_MAX) " 个账户") DIM)
+      0))
+
+;; ---------- 绘图入口 ----------
 (define (draw ui)
   (window-clear ui)
   (window-fill ui 0 0 WIN_W WIN_H BG)
-  ;; 标题栏
-  (window-fill ui 0 0 WIN_W 52 PANEL)
-  (window-shape ui 6 16 14 26 26 LOGO)
-  (window-text ui 23 17 2 "N" WHITE)
-  (window-text ui 54 16 2 "Nuomi MC Launcher" WHITE)
-  (window-text ui 352 22 1 (str "v" VERSION) DIM)
-  ;; 标题栏底分隔线
-  (window-shape ui 1 0 52 WIN_W 1 SEPLINE)
-  ;; 玩家名
-  (window-text ui NAME_X 66 1 "玩家名" DIM)
-  (window-shape ui 6 NAME_X NAME_Y NAME_W NAME_H (if (equal? focus "name") ACCENT BTN_DIS))
-  (window-fill ui (+ NAME_X 4) (+ NAME_Y 4) (- NAME_W 8) (- NAME_H 8) (rgb 16 18 22))
-  (if (equal? USERNAME "")
-      (window-text ui (+ NAME_X 10) (+ NAME_Y 9) 1 "输入玩家名…" DIM)
-      (window-text ui (+ NAME_X 10) (+ NAME_Y 9) 1 USERNAME TEXT))
-  ;; 玩家名光标(闪烁)
-  (if (and (equal? focus "name") (< (% frame 40) 20) (not busy))
-      (window-shape ui 1 (+ NAME_X 10 (* (length USERNAME) 8)) (+ NAME_Y 6) 2 (- NAME_H 12) TEXT)
-      0)
-  ;; 游戏目录
-  (window-text ui PATH_X 128 1 "游戏目录" DIM)
-  (window-shape ui 6 PATH_X PATH_Y PATH_W PATH_H (if (equal? focus "path") ACCENT BTN_DIS))
-  (window-fill ui (+ PATH_X 4) (+ PATH_Y 4) (- PATH_W 8) (- PATH_H 8) (rgb 16 18 22))
-  (if (equal? GAME_DIR "")
-      (window-text ui (+ PATH_X 10) (+ PATH_Y 9) 1 "输入游戏目录…" DIM)
-      (window-text ui (+ PATH_X 10) (+ PATH_Y 9) 1 GAME_DIR TEXT))
-  ;; 目录光标(闪烁)
-  (if (and (equal? focus "path") (< (% frame 40) 20) (not busy))
-      (window-shape ui 1 (+ PATH_X 10 (* (length GAME_DIR) 7)) (+ PATH_Y 6) 2 (- PATH_H 12) TEXT)
-      0)
-  ;; 按钮(待确认时高亮 + 改文字)
-  (window-fill ui B1X BTN_Y BTN_W BTN_H (if busy BTN_DIS (if (equal? pending "launch") ACCENT BTN)))
-  (window-text ui (+ B1X 55) (+ BTN_Y 15) 1 (if (equal? pending "launch") "确认启动?" "启动游戏") WHITE)
-  (window-fill ui B2X BTN_Y BTN_W BTN_H (if busy BTN_DIS (if (equal? pending "download") ACCENT BTN)))
-  (window-text ui (+ B2X 65) (+ BTN_Y 15) 1 (if (equal? pending "download") "确认下载?" "下载资源") WHITE)
-  ;; 状态卡
-  (window-shape ui 6 CARD_X CARD_Y CARD_W CARD_H CARD)
-  (window-text ui STATUS_X STATUS_Y 1 status-msg TEXT)
-  ;; 进度条
-  (window-shape ui 6 BAR_X BAR_Y BAR_W BAR_H BTN_DIS)
-  (if (> ptotal 0)
-      (let ((pw (floor (/ (* BAR_W pcur) ptotal))))
-        (window-fill ui BAR_X BAR_Y pw BAR_H GREEN)
-        (window-text ui (+ BAR_X 6) (+ BAR_Y 1) 1 (str pstage "  " pcur "/" ptotal) WHITE))
-      0)
-  ;; 底部提示
-  (window-text ui 40 414 1 "Esc 退出 · 点输入框编辑 · 按钮需点两次确认" DIM)
+  (draw-sidebar ui)
+  (if (equal? nav "account") (draw-account ui) (draw-launch ui))
   (window-invalidate ui))
 
 ;; ---------- 触发后台任务 ----------
 (define (spawn mode)
   (set! busy true)
   (set! pending "")
-  (set! status-msg (str "已在后台启动「" mode "」，请稍候…"))
+  (set! status-msg (str "已在后台"
+    (if (equal? mode "launch") "启动游戏" "下载资源") "，请稍候"))
   (set! pstage mode) (set! pcur 0) (set! ptotal 0)
   (write-file PROG (str mode "|0|0"))
   (proc-run "cmd" (list "/c"
@@ -123,8 +433,81 @@
          "&& set NUOMI_USERNAME=" USERNAME
          "&& set NUOMI_GAME_DIR=" GAME_DIR
          "&& set NUOMI_PROGRESS_FILE=" PROG
-         "&& cd /d " LAUNCH_DIR
-         "&& start /min " LAUNCH_DIR "\\nuomi.exe launcher.nuomi"))))
+        "&& cd /d " LAUNCH_DIR
+        "&& start /min " LAUNCH_DIR "\\nuomi.exe launcher.nuomi"))))
+
+;; ---------- 触发登录流程(独立进程) ----------
+;; mode: "auth-ms" | "auth-littleskin"
+(define (spawn-auth mode)
+  (set! auth-busy true)
+  (set! auth-state "pending")
+  (set! auth-msg "正在连接登录服务")
+  (write-file AUTH_RES "")
+  (proc-run "cmd" (list "/c"
+    (str "set NUOMI_MODE=" mode
+        "&& cd /d " LAUNCH_DIR
+        "&& start /min " LAUNCH_DIR "\\nuomi.exe launcher.nuomi"))))
+
+;; LittleSkin 登录: 先把账号密码写到临时凭据文件, 再让 launcher 子进程读取并删除
+(define (login-littleskin)
+  (write-file LS_CRED (str ls-user "\t" ls-pass))
+  (set! ls-pass "")
+  (set! focus2 "")
+  (spawn-auth "auth-littleskin"))
+
+;; 轮询登录结果(读取 .auth_result.txt)
+;; 格式是【单行 | 分隔】: ok|name|uuid / error|msg / pending|code|uri
+;; ⚠️ 别用 "\n" 分行 —— launcher 写的是一整行, 分行会导致状态永远匹配不上。
+(define (poll-auth)
+  (if (not (exists? AUTH_RES)) 0
+    (let ((raw (str-replace (str-replace (read-file AUTH_RES) "\r" "") "\n" "")))
+      (if (or (null? raw) (equal? raw "")) 0
+        (let ((parts (str-split raw "|")))
+          (if (< (length parts) 2) 0
+            (let* ((st (get parts 0))
+                   (msg (get parts 1))
+                   (extra (if (>= (length parts) 3) (get parts 2) "")))
+              (if (equal? st "ok")
+                  (begin
+                    (set! auth-state "ok")
+                    (set! auth-msg (str "登录成功：" msg))
+                    (set! auth-busy false)
+                    (reload-accts)
+                    0)
+                  (if (equal? st "error")
+                      (begin
+                        (set! auth-state "error")
+                        (set! auth-msg (str "登录失败：" msg))
+                        (set! auth-busy false)
+                        0)
+                      (if (equal? st "pending")
+                          (begin
+                            (set! auth-state "pending")
+                            ;; launcher 已自动打开浏览器, 这里只显示设备码, 不塞长 URL(会超右边界)
+                            (set! auth-msg (str "浏览器已打开，输入代码 " msg))
+                            0)
+                          0))))))))))
+
+;; ---------- 浏览文件夹(系统选择框, 免手输路径) ----------
+;;   用 PowerShell 的 Shell.Application COM 弹原生文件夹选择框; 选中路径写到临时文件再读回。
+;;   脚本全程 ASCII(描述用英文), 路径经 UTF-8 文件传递, 避开 cmd/powershell 参数里的编码坑。
+(define (browse-dir)
+  ;; 1) 当前目录作为初始位置
+  (write-file BROWSE_INIT GAME_DIR)
+  ;; 2) 清空上次结果(取消时文件保持空 -> 不更新)
+  (write-file BROWSE_OUT "")
+  ;; 3) 写一段 ASCII 的 PS 脚本(单行, 用分号分隔语句)
+  (write-file BROWSE_PS (str "$init=[System.IO.File]::ReadAllText('" BROWSE_INIT "');if(Test-Path $init){$root=$init}else{$root=0}$shell=New-Object -ComObject Shell.Application;$folder=$shell.BrowseForFolder(0,'Select game directory',0,$root);if($folder -ne $null){[System.IO.File]::WriteAllText('" BROWSE_OUT "',$folder.Self.Path)}"))
+  ;; 4) 弹框(同步阻塞, 直到用户选完或取消); 无 stdout, proc-run 会等到进程退出
+  (proc-run "powershell" (list "-NoProfile" "-ExecutionPolicy" "Bypass" "-File" BROWSE_PS))
+  ;; 5) 读取结果
+  (if (and (exists? BROWSE_OUT) (> (file-size BROWSE_OUT) 0))
+      (let ((p (read-file BROWSE_OUT)))
+        (if (and (not (null? p)) (not (equal? p "")))
+            (begin (set! GAME_DIR p) (set! focus "") (set! pending "")
+                   (set! status-msg "已选择目录，可直接点启动/下载") 0)
+            0))
+      0))
 
 ;; ---------- 读进度 ----------
 (define (poll)
@@ -146,52 +529,110 @@
     (set! cl (window-click))
     (set! ch (window-char))
     (set! ev (window-event))
-    ;; 鼠标点击(二次确认)
+    ;; 鼠标点击
     (if (not (null? cl))
         (let ((cx (floor (/ cl 100000))) (cy (% cl 100000)))
-          (if (in-rect cx cy B1X BTN_Y BTN_W BTN_H)
-              (if (equal? pending "launch") (spawn "launch") (if (not busy) (set! pending "launch") 0))
-              (if (in-rect cx cy B2X BTN_Y BTN_W BTN_H)
-                  (if (equal? pending "download") (spawn "download") (if (not busy) (set! pending "download") 0))
-                  (if (in-rect cx cy NAME_X NAME_Y NAME_W NAME_H)
-                      (begin (set! focus "name") (set! pending ""))
-                      (if (in-rect cx cy PATH_X PATH_Y PATH_W PATH_H)
-                          (begin (set! focus "path") (set! pending ""))
-                          (set! pending "")))))
+          ;; 侧栏导航(三个)
+          (if (in-rect cx cy NAV_X NAV1_Y NAV_W NAV_H)
+              (begin (set! nav "launch") (set! pending "") (set! focus2 ""))
+              (if (in-rect cx cy NAV_X NAV2_Y NAV_W NAV_H)
+                  (begin (set! nav "download") (set! pending "") (set! focus2 ""))
+                  (if (in-rect cx cy NAV_X NAV3_Y NAV_W NAV_H)
+                      (begin (set! nav "account") (set! pending "") (set! focus2 "")
+                             (reload-accts) (reload-cid) (set! auth-msg ""))
+                      ;; 账户页交互
+                      (if (equal? nav "account")
+                          (begin
+                            ;; 微软登录
+                            (if (in-rect cx cy MS_X MS_Y MS_W MS_H)
+                                (if (not auth-busy) (spawn-auth "auth-ms") 0)
+                                ;; 微软 client_id 输入框 + 保存按钮
+                                (if (in-rect cx cy CID_X CID_Y CID_W CID_H)
+                                    (if (not auth-busy) (begin (set! focus2 "cid") (set! auth-msg "")) 0)
+                                    (if (in-rect cx cy CID_SAVE_X CID_SAVE_Y CID_SAVE_W CID_SAVE_H)
+                                        (if (not auth-busy) (save-cid) 0)
+                                        ;; LittleSkin 用户名/密码框
+                                        (if (in-rect cx cy LSU_X LSU_Y LSU_W LSU_H)
+                                            (if (not auth-busy) (begin (set! focus2 "lsu") (set! auth-msg "")) 0)
+                                            (if (in-rect cx cy LSW_X LSW_Y LSW_W LSW_H)
+                                                (if (not auth-busy) (begin (set! focus2 "lsw") (set! auth-msg "")) 0)
+                                                ;; LittleSkin 登录按钮
+                                                (if (in-rect cx cy LSB_X LSB_Y LSB_W LSB_H)
+                                                    (if (and (not auth-busy) (not (equal? ls-user "")) (not (equal? ls-pass "")))
+                                                        (login-littleskin) 0)
+                                                    ;; 已存账户列表(点击切换)
+                                                    (if (or (null? accs) (< (length accs) 1)) 0
+                                                        (let ((idx (floor (/ (- cy AC_LIST_Y) AC_ITEM_H))))
+                                                          (if (and (>= idx 0) (< idx (length accs)) (< idx AC_MAX))
+                                                              (switch-acct (get (get accs idx) 2))
+                                                              0)))
+                                                    0)))
+                                            0))
+                                0))
+                          ;; 启动/下载页交互
+                          (if (in-rect cx cy MB_X MB_Y MB_W MB_H)
+                              (if (equal? pending nav) (spawn nav) (if (not busy) (set! pending nav) 0))
+                              (if (in-rect cx cy NAME_X NAME_Y NAME_W NAME_H)
+                                  (begin (set! focus "name") (set! pending ""))
+                                  (if (in-rect cx cy PATH_X PATH_Y PATH_W PATH_H)
+                                      (begin (set! focus "path") (set! pending ""))
+                                      (if (in-rect cx cy BROWSE_X BROWSE_Y BROWSE_W BROWSE_H)
+                                          (if (not busy) (begin (browse-dir) (set! pending "")) 0)
+                                          (set! pending ""))))))))))
         0)
-    ;; 字符输入(仅对应焦点框, 且未在下载)
-    (if (and (not (null? ch)) (not busy))
-        (if (equal? focus "name")
-            (if (< (length USERNAME) 16) (set! USERNAME (str USERNAME ch)) 0)
-            (if (equal? focus "path")
-                (if (< (length GAME_DIR) 120) (set! GAME_DIR (str GAME_DIR ch)) 0)
-                0))
+    ;; 字符输入
+    (if (and (not (null? ch)) (not busy) (not auth-busy))
+        (if (equal? nav "account")
+            (if (equal? focus2 "lsu")
+                (if (< (length ls-user) 32) (set! ls-user (str ls-user ch)) 0)
+                (if (equal? focus2 "lsw")
+                    (if (< (length ls-pass) 64) (set! ls-pass (str ls-pass ch)) 0)
+                    (if (equal? focus2 "cid")
+                        (if (< (length ms-cid) 64) (set! ms-cid (str ms-cid ch)) 0)
+                        0)))
+            (if (equal? focus "name")
+                (if (< (length USERNAME) 16) (set! USERNAME (str USERNAME ch)) 0)
+                (if (equal? focus "path")
+                    (if (< (length GAME_DIR) 120) (set! GAME_DIR (str GAME_DIR ch)) 0)
+                    0)))
         0)
     ;; 退格
-    (if (and (equal? ev "back") (not busy))
-        (if (equal? focus "name")
-            (if (> (length USERNAME) 0) (set! USERNAME (substring USERNAME 0 (- (length USERNAME) 1))) 0)
-            (if (equal? focus "path")
-                (if (> (length GAME_DIR) 0) (set! GAME_DIR (substring GAME_DIR 0 (- (length GAME_DIR) 1))) 0)
-                0))
+    (if (and (equal? ev "back") (not busy) (not auth-busy))
+        (if (equal? nav "account")
+            (if (equal? focus2 "lsu")
+                (if (> (length ls-user) 0) (set! ls-user (substring ls-user 0 (- (length ls-user) 1))) 0)
+                (if (equal? focus2 "lsw")
+                    (if (> (length ls-pass) 0) (set! ls-pass (substring ls-pass 0 (- (length ls-pass) 1))) 0)
+                    (if (equal? focus2 "cid")
+                        (if (> (length ms-cid) 0) (set! ms-cid (substring ms-cid 0 (- (length ms-cid) 1))) 0)
+                        0)))
+            (if (equal? focus "name")
+                (if (> (length USERNAME) 0) (set! USERNAME (substring USERNAME 0 (- (length USERNAME) 1))) 0)
+                (if (equal? focus "path")
+                    (if (> (length GAME_DIR) 0) (set! GAME_DIR (substring GAME_DIR 0 (- (length GAME_DIR) 1))) 0)
+                    0)))
         0)
     ;; 退出
     (if (equal? ev "esc") (begin (window-close ui) (set! done true)) 0)
     (if (equal? ev "close") (set! done true) 0)
-    ;; 轮询后台进度
+    ;; 轮询后台进度 / 登录结果
     (if busy (poll) 0)
+    (if auth-busy (poll-auth) 0)
     ;; 重绘
     (if (not done) (draw ui) 0)
     ;; 帧计数(光标闪烁用) + 节流
     (set! frame (+ frame 1))
-    (sleep 16))))
+    (sleep 16)))
 
 ;; ---------- 入口 ----------
 (define (gui-main)
-  (define ui (window-create 200 150 WIN_W WIN_H "Nuomi 启动器"))
+  (define ui (window-create 200 120 WIN_W WIN_H "Nuomi 启动器"))
   (if (null? ui)
       (println "GUI: 窗口创建失败 (可能在无桌面/无 GUI 环境)")
-      (begin (draw ui) (gui-loop ui) (println "GUI 已退出"))))
+      (begin
+        (reload-accts)
+        (reload-cid)
+        (draw ui) (gui-loop ui) (println "GUI 已退出"))))
 
 (if IS_TEST
     (println "gui.nuomi 语法自检通过")

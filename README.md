@@ -4,9 +4,9 @@
 > 全部走 Mojang 官方 Piston API 下载。
 
 ```
-E:/workbuddy/2026-10-28-17-17-07/nuomi-launcher/
+NuomiLauncher/
 ├── launcher.nuomi     ← 启动器本体（全部逻辑都在这一个文件里）
-├── gui.nuomi          ← 图形界面（自绘窗口，鼠标点 + 输入玩家名）
+├── gui.nuomi          ← 图形界面（自绘窗口：启动/下载/账户登录三页）
 ├── nuomi.exe          ← 糯米解释器（含本项目给 Nuomi 加的原生函数）
 ├── start.bat          ← 双击运行（纯英文 + GBK + CRLF）
 └── README.md
@@ -33,7 +33,7 @@ nuomi.exe launcher.nuomi
 nuomi.exe gui.nuomi
 ```
 
-> 如果按之前步骤把 `C:\Users\RAYN\mc-launcher` 前置到了 PATH，
+> 如果按之前步骤把 `%USERPROFILE%\mc-launcher` 前置到了 PATH，
 > 命令行里直接打 `nuomi MC-gui` 也能开图形界面（其它模式：`nuomi MC-start` /
 > `nuomi MC-download` / `nuomi MC-dry`）。
 
@@ -50,7 +50,10 @@ nuomi.exe gui.nuomi
 - **启动游戏** 按钮：下载全部资源并启动 Minecraft
 - **下载资源** 按钮：只下载，不启动
 - **状态文字** + **进度条**：显示后台任务进行到哪（库 N/total、资源 N/total）
+- **账户登录** 页（侧栏第三项）：微软 / LittleSkin 登录、client_id 设置、已登录账户一键切换
 - `Esc` 或点窗口右上角 `X` 退出
+
+> 按钮采用**二次确认**：点一下变亮显示「确认启动?」，再点一次才真正执行；点别处会取消，防止误触下载。
 
 > 💡 后端其实是 `launcher.nuomi`（CLI）。GUI 用 `cmd /c start /min` 异步拉起它，
 > 进度写进 `%USERPROFILE%/.nuomi-mc/gui_progress.txt`，GUI 轮询显示——
@@ -177,12 +180,72 @@ build.bat
 
 ---
 
-## 八、离线模式的说明
+## 八、账户登录（微软 / LittleSkin / 离线）
+
+启动器支持三种账户，**登录后启动游戏会自动带上对应账号**，不用再手填玩家名。
+在 GUI 侧栏点「账户登录」进入，或直接用命令行模式：
+
+```bat
+set NUOMI_MODE=auth-ms          && nuomi.exe launcher.nuomi   :: 微软设备码登录
+set NUOMI_MODE=auth-littleskin  && nuomi.exe launcher.nuomi   :: LittleSkin 外置登录
+```
+
+### 8.1 微软账号（正版）
+
+走 **OAuth 设备码流**：点「使用微软账号登录」→ 自动打开浏览器 → 在页面输入界面显示的
+一次性代码 → 启动器后台轮询，登录成功后自动保存账户。
+
+> ⚠️ **必须自备 Azure 应用的 client_id**。
+> 早期各开源启动器共用的公共 ID `00000000402b5328` **已被微软从目录中移除**，
+> 现在会直接返回 `AADSTS700016 unauthorized_client`。第三方启动器只能用自己的应用 ID。
+> 好在注册完全免费、不用信用卡，五分钟搞定：
+
+1. 打开 <https://portal.azure.com>，用你的微软账号登录
+2. 搜索并进入 **Microsoft Entra ID** → 左侧 **App registrations** → **New registration**
+3. Name 随便填（比如 `NuomiLauncher`）
+4. **Supported account types** 选 **Accounts in any organizational directory (Any Azure AD directory - Multitenant) and personal Microsoft accounts (e.g. Skype, Xbox)** —— 也就是要包含「个人 Microsoft 账户」
+5. Redirect URI 留空，点 **Register**
+6. 创建后进应用的 **Authentication** 页，找到 **Allow public client flows**，把它设为 **Yes**（设备码流必需，否则仍会报 unauthorized_client），记得保存
+7. 回到 **Overview**，复制 **Application (client) ID**（一串 UUID 格式）
+8. 粘贴到启动器「账户登录」页的 **微软 client_id** 输入框，点「保存」
+
+配置存在 `%USERPROFILE%/.nuomi-mc/ms_client_id.txt`，填一次即可，之后不用再管。
+登录链路：devicecode → XBL → XSTS → `login_with_xbox` → 取 MC profile，
+启动参数会带 `--clientId` / `--xuid` / `--userType msa` / `--accessToken`。
+
+> 小提示：即使不登录，离线模式照样能玩单机；正版验证只在进正版服务器时需要。
+
+### 8.2 LittleSkin（外置登录 / Yggdrasil）
+
+填**角色名 + 密码**，点「登录 LittleSkin」。密码以 `*` 遮盖，且**不会保存到磁盘**：
+GUI 只把它写进一个临时凭据文件，后台子进程读完立刻删除。
+
+登录成功后启动参数会追加：
+
+```
+--authServer https://littleskin.cn/api/yggdrasil/authserver
+--sessionServer https://littleskin.cn/api/yggdrasil/sessionserver
+```
+
+> LittleSkin 的认证接口现在要求请求体带 `agent` 对象（`{"name":"Minecraft","version":1}`），
+> 少了会返回 400 `agent must be an object` —— 启动器已经带上了。
+
+### 8.3 账户存储与切换
+
+| 文件 | 内容 |
+|---|---|
+| `.nuomi-mc/accounts.txt` | TAB 分隔 7 列：`type/name/uuid/token/extra1/extra2/expires` |
+| `.nuomi-mc/account_current.txt` | 当前选中的账户 uuid |
+| `.nuomi-mc/.auth_result.txt` | 登录状态回传：`pending\|code\|uri` / `ok\|name\|uuid` / `error\|msg` |
+| `.nuomi-mc/ms_client_id.txt` | 你自己的 Azure client_id |
+
+GUI 账户页下方的「已登录账户」列表，点一下就能切换当前账户。
+
+### 8.4 离线模式（不登录时）
 
 - UUID 每次随机生成（v4），token 随机 40 位十六进制 → **每次启动都是"新账号"**
 - 皮肤是默认的 Steve/Alex，进不去正版服务器
 - 单机存档完全正常
-- **想做正版登录**的话，需要另外接微软 OAuth（任务 6，还没做）
 
 ---
 
@@ -199,5 +262,6 @@ build.bat
   - 嫌慢/网络差：调 `launcher.nuomi` 里的 `PARALLEL_MAX`（网络好可上 50，慢网降到 8~16）
   - 彻底不要资源包：把 `DOWNLOAD_ASSETS` 改成 `false`
     （缺资源只有贴图/音效报错，**游戏照样能进主菜单**）
-- 不支持多实例切换
-- 离线模式每次启动都是新 UUID（皮肤只有默认 Steve/Alex）
+- 不支持多实例切换（但**支持多账户切换**，见第八节）
+- 离线模式每次启动都是新 UUID（皮肤只有默认 Steve/Alex）；登录后使用真实账户
+- 微软登录需要你自己注册 Azure 应用并填 client_id（公共 ID 已被微软下架，见 8.1）

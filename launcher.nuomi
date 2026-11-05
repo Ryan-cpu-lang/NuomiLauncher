@@ -39,23 +39,72 @@
 (define LAUNCHER_NAME "NuomiLauncher")
 (define LAUNCHER_VERSION "0.1")
 ;; ---------------- 常量 ----------------
+;; ---- 国内镜像(BMCLAPI): Mojang 官方 CDN 在国内常被墙/超慢, 改用 BMCLAPI ----
+;; 想退回官方源: 把 USE_MIRROR 改成 false 即可(下载仍走 SHA1 校验, 安全不受影响)
+(define USE_MIRROR true)
+(define MIRROR "https://bmclapi2.bangbang93.com")
+(define RDN "resources.download.minecraft.net")
+(define LMN "libraries.minecraft.net")
+;; 把一个 Mojang CDN 的 URL 换成 BMCLAPI 镜像地址(重定向/证书由 http.c 统一处理)
+(define (mirror url)
+  (if (not USE_MIRROR) url
+    (if (contains? url RDN)
+        (str MIRROR "/assets" (substring url (+ 8 (length RDN))))
+        (if (contains? url LMN)
+            (str MIRROR "/maven" (substring url (+ 8 (length LMN))))
+            (if (or (contains? url "piston-meta.mojang.com")
+                    (contains? url "piston-data.mojang.com")
+                    (contains? url "launchermeta.mojang.com")
+                    (contains? url "launcher.mojang.com"))
+                (str MIRROR (substring url (string-search url "/" 8)))
+                url)))))
 (define PISTON_MANIFEST "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json")
 ;; 依赖库默认 CDN(元数据里每个条目其实都自带 url, 优先用元数据的)
-(define LIB_BASE "https://libraries.minecraft.net/")
+(define LIB_BASE "https://libraries.minecraft.net/")          ; 始终官方; 下载时再按需 mirror
 ;; 资源对象 CDN
-(define ASSET_BASE "https://resources.download.minecraft.net/")
+(define ASSET_BASE "https://resources.download.minecraft.net/")  ; 始终官方; 下载时再按需 mirror
+
+;; ============================================================
+;;  登录相关配置 (离线 / 微软 / LittleSkin)
+;; ============================================================
+;; ⚠️ 社区公开 client_id (00000000402b5328) 已被微软从目录中移除(AADSTS700016),
+;;    设备码流会直接报 unauthorized_client。第三方启动器必须用自己注册的 Azure 应用:
+;;    在 https://portal.azure.com -> Microsoft Entra ID -> App registrations -> New registration
+;;    (账号类型选「个人 Microsoft 账户」) -> Authentication 页勾选 Allow public client flows
+;;    -> 复制 Application (client) ID, 填到启动器的「微软 client_id」输入框即可。
+(define MS_CLIENT_ID_DEFAULT "00000000402b5328")
+(define MS_TENANT "consumers")
+(define MS_SCOPE "XboxLive.signin%20offline_access")
+(define LS_AUTH "https://littleskin.cn/api/yggdrasil/authserver")
+(define LS_SESSION "https://littleskin.cn/api/yggdrasil/sessionserver")
 
 ;; ---------------- 运行态全局(由 run 填充) ----------------
 ;; 主目录: Windows 取 USERPROFILE, 其它平台取 HOME; 都取不到就退回当前工作目录。
 ;; ⚠️ 注意: (home) 是「光标复位 + 隐藏光标」的终端指令, 不是主目录查询, 千万别用!
 (define HOME-RAW (if (equal? OS "windows") (getenv "USERPROFILE") (getenv "HOME")))
 (define HOME (if (string? HOME-RAW) (str-replace HOME-RAW "\\" "/") "."))
+;; 账户存储路径(与游戏目录解耦, 固定落在 USERPROFILE/.nuomi-mc; 必须在 HOME 之后定义)
+(define ACCOUNTS_DIR (str HOME "/.nuomi-mc"))
+(define ACCOUNTS_FILE (str ACCOUNTS_DIR "/accounts.txt"))
+(define CURRENT_FILE (str ACCOUNTS_DIR "/account_current.txt"))
+(define AUTH_RESULT_FILE (str ACCOUNTS_DIR "/.auth_result.txt"))
+(define LS_CRED_FILE (str ACCOUNTS_DIR "/._ls_cred.txt"))
+(define ACCOUNTS_CACHE nil)   ; 进程内账户缓存: 在重型 I/O 前一次性读取, 避免解释器堆串扰
+
+;; 微软 client_id: 优先用用户自己注册的(存在 ms_client_id.txt), 否则退回默认值
+(define MS_CLIENT_ID_FILE (str ACCOUNTS_DIR "/ms_client_id.txt"))
+(define MS_CLIENT_ID
+  (if (exists? MS_CLIENT_ID_FILE)
+      (let ((c (str-replace (str-replace (read-file MS_CLIENT_ID_FILE) "\r" "") "\n" "")))
+        (if (equal? c "") MS_CLIENT_ID_DEFAULT c))
+      MS_CLIENT_ID_DEFAULT))
 (define BASE_DIR (let ((d (getenv "NUOMI_GAME_DIR")))
                    (if (or (null? d) (equal? d "")) (str HOME "/.nuomi-mc") d)))
 (define NATIVES_DIR "")
 (define CLASSPATH "")
 (define UUID "")
 (define TOKEN "")
+(define USER_TYPE "mojang")
 (define INSTANCE_DIR "")
 (define ASSETS_DIR "")
 (define ASSET_ID "")
@@ -207,33 +256,93 @@
       (if (ends-with? cls "-x86") "x86" nil))))
 
 ;; ============================================================
-;;  下载 + SHA1 校验
+;;  下载 + SHA1 校验(curl 通道)
+;;
+;;  为什么用 curl 而不是自带 http-download:
+;;    BMCLAPI 镜像会 302 到一个证书不被信任的回源, Nuomi 自带的 WinINet
+;;    处理得不顺; 而系统自带的 curl.exe 自带 -L 跟随重定向 + -k 忽略坏证书
+;;    + -f 遇 HTTP 错误即失败 + --retry 自动重试, 在国内网络下稳得多。
+;;    Windows 10 1803+ 均自带 curl.exe。
 ;; ============================================================
 
-;; 下载一个文件并校验 sha1
-;;   · 目标已存在且 sha1 匹配 -> 跳过(返回 0)
-;;   · 下载成功且 sha1 匹配   -> 返回字节数
-;;   · 失败                   -> 返回 -1
-(define (download-verify url dest sha1)
+;; 本机是否有 curl(老系统没有就退回自带 http-download)
+(define HAVE_CURL true)   ; Windows 10 1803+ 自带 curl.exe
+
+;; 用 curl 下载到 dest(自动建父目录、跟随重定向、忽略坏证书、HTTP 错误即失败、失败重试)
+(define (curl-download url dest)
   (ensure-parent dest)
-  (define need-dl true)
-  (if (exists? dest)
-      (if (null? sha1)
-          (set! need-dl false)
-          (if (equal? (sha1-file dest) sha1)
-              (set! need-dl false)
-              (set! need-dl true)))
-      (set! need-dl true))
-  (define n -1)
-  (if (not need-dl) 0
-    (begin
-      (set! n (http-download url dest UA))
-      ;; http-download 失败时可能返回 -1 或 nil, 两种都要当失败处理
-      (if (or (null? n) (= n -1))
-          (begin (say (str "  ✘ 下载失败: " (short url))) -1)
-          (if (null? sha1) n
-            (if (equal? (sha1-file dest) sha1) n
-              (begin (say (str "  ✘ SHA1 不匹配: " (short dest))) -1)))))))
+  (if HAVE_CURL
+      (proc-run "curl" (list "-sS" "-L" "-k" "-f" "--retry" "5" "--retry-all-errors" "--retry-delay" "1"
+                             "-A" UA "--create-dirs" "-o" dest url))
+      (http-download url dest UA)))
+
+;; 抓取字符串(走 curl 写临时文件再读回); 失败返回 nil
+(define FETCH_TMP (str BASE_DIR SEP "._fetch.tmp"))
+(define (fetch-str url)
+  (curl-download url FETCH_TMP)
+  (if (and (exists? FETCH_TMP) (> (file-size FETCH_TMP) 0))
+      (read-file FETCH_TMP) nil))
+
+;; 粗略判断字符串像不像 JSON(首非空字符为 { 或 [)
+;;  用于识别 BMCLAPI 返回的「警告页」HTML 而不是真正的清单 JSON
+(define (json-body? s)
+  (if (or (null? s) (not (string? s)) (equal? s "")) false
+    (let ((i 0) (n (length s)) (c ""))
+      (while (and (< i n) (or (equal? (set! c (substring s i (+ i 1))) " ")
+                              (equal? c "\t") (equal? c "\n") (equal? c "\r")))
+        (set! i (+ i 1)))
+      (if (>= i n) false
+        (or (equal? (substring s i (+ i 1)) "{")
+            (equal? (substring s i (+ i 1)) "["))))))
+
+;; 重试抓取: 反复抓直到内容「像 JSON」或次数耗尽
+;;  应对 BMCLAPI 偶发「警告页」/TLS 抖动(实测同一地址多试几次往往能拿到真文件)
+(define (fetch-url-json url n)
+  (define i 0) (define s nil)
+  (while (< i n)
+    (set! s (fetch-str url))
+    (if (json-body? s) (set! i n) (set! i (+ i 1))))
+  s)
+
+;; 抓取并解析 JSON: 先试镜像(重试多次以越过偶发警告页), 仍不行再试官方源
+(define (fetch-json official-url)
+  (define s (fetch-url-json (mirror official-url) 3))
+  (if (json-body? s) (json-parse s)
+    (let ((s2 (fetch-url-json official-url 2)))
+      (if (json-body? s2) (json-parse s2) nil))))
+
+;; 下载文件并校验 sha1: 镜像失败自动回退官方源
+;;   入参 url 必须是「官方源 URL」, 本函数内部按 USE_MIRROR 决定是否走镜像。
+;;   镜像最多试 3 次(应对 BMCLAPI 偶发警告页/TLS 抖动), 仍失败再回退官方源(2 次)。
+(define (fetch-file official-url dest sha1)
+  (define ok false) (define r 0) (define i 0)
+  ;; 1) 镜像: 最多 3 次
+  (set! i 0)
+  (while (and (not ok) (< i 3))
+    (set! r (curl-download (mirror official-url) dest))
+    (set! ok (and (= r 0) (exists? dest)
+                  (or (null? sha1) (equal? sha1 "") (equal? (sha1-file dest) sha1))))
+    (if (not ok) (set! i (+ i 1)) 0))
+  ;; 2) 官方源兜底: 最多 2 次
+  (if (not ok)
+      (begin
+        (say (str "  ⚠ 镜像下载失败, 回退官方源"))
+        (set! i 0)
+        (while (and (not ok) (< i 2))
+          (set! r (curl-download official-url dest))
+          (set! ok (and (= r 0) (exists? dest)
+                        (or (null? sha1) (equal? sha1 "") (equal? (sha1-file dest) sha1))))
+          (if (not ok) (set! i (+ i 1)) 0))))
+  (if ok 0 -1))
+
+;; 下载一个文件并校验 sha1(对上层暴露的入口)
+;;   · 成功 -> 返回字节数(已存在且匹配则 0)
+;;   · 失败 -> 返回 -1
+(define (download-verify url dest sha1)
+  (define r (fetch-file url dest sha1))
+  (if (= r -1)
+      (begin (say (str "  ✘ 下载/校验失败: " (short url))) -1)
+      (if (exists? dest) (file-size dest) 0)))
 
 ;; 进度文件(供 GUI 前端轮询显示); 未设置 NUOMI_PROGRESS_FILE 时为空, 下列函数自动跳过
 (define PROGRESS_FILE (getenv "NUOMI_PROGRESS_FILE"))
@@ -270,8 +379,13 @@
 ;;  Nuomi 原生串行仍保留为兜底(USE_CURL_PARALLEL=false 时走)。
 ;; ============================================================
 
-;; 单个资源对象的 curl -K 配置行(url + output 两行)
+;; 单个资源对象的 curl -K 配置行(url + output 两行); 走镜像
 (define (asset-entry-cfg h)
+  (str "url = \"" (mirror (str ASSET_BASE (substring h 0 2) SEP h)) "\"\n"
+       "output = \"" ASSETS_DIR SEP "objects" SEP (substring h 0 2) SEP h "\"\n"))
+
+;; 同上, 但强制走官方源(供「重试失败项」回退用)
+(define (asset-entry-cfg-official h)
   (str "url = \"" ASSET_BASE (substring h 0 2) SEP h "\"\n"
        "output = \"" ASSETS_DIR SEP "objects" SEP (substring h 0 2) SEP h "\"\n"))
 
@@ -316,13 +430,13 @@
       (define buf "") (define cnt 0) (define h nil) (define i 0)
       (while (< i (length asset-fails))
         (set! h (get asset-fails i))
-        (set! buf (str buf (asset-entry-cfg h)))
+        (set! buf (str buf (asset-entry-cfg-official h)))
         (set! cnt (+ cnt 1))
         (if (= cnt 256) (begin (append-file cfg buf) (set! buf "") (set! cnt 0)) 0)
         (set! i (+ i 1)))
       (if (> cnt 0) (append-file cfg buf) 0)
       (say (str "  ↻ 重试失败项 (" (length asset-fails) " 个)..."))
-      (proc-run "curl" (list "-s" "-S" "-Z" "--parallel-max" "8" "--create-dirs" "-K" cfg))
+      (proc-run "curl" (list "-s" "-S" "-L" "-k" "-f" "--retry" "5" "--retry-delay" "1" "-Z" "--parallel-max" "8" "--create-dirs" "-K" cfg))
       (define still 0) (define j 0) (define dest nil)
       (while (< j (length asset-fails))
         (set! h (get asset-fails j))
@@ -338,7 +452,7 @@
   (say (str "  生成 curl 清单 (" asset-count " 个)..."))
   (build-asset-cfg cfg)
   (say (str "» curl --parallel-max " (str PARALLEL_MAX) " 批量下载资源(" asset-count " 个, 静默)..."))
-  (proc-run "curl" (list "-s" "-S" "-Z" "--parallel-max" (str PARALLEL_MAX) "--create-dirs" "-K" cfg))
+  (proc-run "curl" (list "-s" "-S" "-L" "-k" "-f" "--retry" "5" "--retry-delay" "1" "--parallel-max" (str PARALLEL_MAX) "--create-dirs" "-K" cfg))
   (set! asset-fails '())
   (verify-assets)
   (say (str "  校验完成: 失败/缺失 " afailed " 个"))
@@ -391,7 +505,7 @@
     (list "${auth_access_token}" TOKEN)
     (list "${clientid}" CLIENT_ID)
     (list "${auth_xuid}" XUID)
-    (list "${user_type}" "mojang")
+    (list "${user_type}" USER_TYPE)
     (list "${version_type}" "release")))
   (define i 0)
   (define res s)
@@ -434,7 +548,7 @@
 ;; url 优先用元数据里给的地址(CDN 会变, 硬拼 base 迟早失效); 没有再退回 LIB_BASE
 (define (make-entry kind path url sha1)
   (vec kind (str "libraries" SEP path)
-       (if (null? url) (str LIB_BASE path) url)
+       (if (null? url) (str LIB_BASE path) url)   ; 存官方 URL, 下载时再 mirror
        sha1))
 
 ;; 一个库条目展开成的条目列表(0~2 个)
@@ -521,6 +635,207 @@
   s)
 
 ;; ============================================================
+;;  账户 / 登录 (离线 / 微软 / LittleSkin)
+;; ============================================================
+;; 账户元组: (type name uuid token extra1 extra2 expires)
+;;   offline   : type=offline,   extra1/2=""
+;;   microsoft : type=microsoft, extra1=ms_refresh, extra2=xuid(uhs)
+;;   littleskin: type=littleskin, extra1=authserver, extra2=sessionserver
+(define (load-accounts)
+  (if (not (null? ACCOUNTS_CACHE)) ACCOUNTS_CACHE
+    (if (not (exists? ACCOUNTS_FILE)) (list)
+    (let ((raw (read-file ACCOUNTS_FILE)))
+      (let ((lines (str-split raw "\n")) (out (list)))
+        (while (not (null? lines))
+          (let ((ln (str-replace (car lines) "\r" "")))
+            (set! lines (cdr lines))
+            (if (equal? ln "") 0
+              (let ((f (str-split ln "\t")))
+                (if (>= (length f) 7)
+                    (set! out (cons (list (get f 0)(get f 1)(get f 2)(get f 3)(get f 4)(get f 5)(get f 6)) out))
+                    0)))))
+          (set! ACCOUNTS_CACHE out)
+          out)))))
+(define (reload-accounts)
+  (set! ACCOUNTS_CACHE nil)
+  (set! ACCOUNTS_CACHE (load-accounts))
+  ACCOUNTS_CACHE)
+(define (save-accounts accs)
+  (ensure-parent ACCOUNTS_FILE)
+  (define buf "")
+  (while (not (null? accs))
+    (let ((a (car accs)))
+      (set! accs (cdr accs))
+      (set! buf (str buf (get a 0) "\t" (get a 1) "\t" (get a 2) "\t" (get a 3) "\t" (get a 4) "\t" (get a 5) "\t" (get a 6) "\n"))))
+  (write-file ACCOUNTS_FILE buf))
+(define (upsert-account a)
+  (define accs (load-accounts)) (define out (list))
+  (while (not (null? accs))
+    (let ((x (car accs))) (set! accs (cdr accs))
+      (if (equal? (get x 2) (get a 2)) 0 (set! out (cons x out)))))
+  (set! out (cons a out))
+  (save-accounts out)
+  (reload-accounts)
+  (write-file CURRENT_FILE (get a 2))
+  (get a 2))
+(define (get-current-uuid)
+  (if (not (exists? CURRENT_FILE)) ""
+    (str-replace (str-replace (read-file CURRENT_FILE) "\r" "") "\n" "")))
+(define (set-current-uuid u) (write-file CURRENT_FILE u))
+(define (get-account-by-uuid u)
+  (define accs (load-accounts))
+  (while (and (not (null? accs)) (not (equal? (get (car accs) 2) u)))
+    (set! accs (cdr accs)))
+  (if (null? accs) nil (car accs)))
+(define (get-current-account) (get-account-by-uuid (get-current-uuid)))
+(define (write-auth-status s) (write-file AUTH_RESULT_FILE s))
+
+;; ---- HTTP POST (curl; 返回解析后的 JSON, 失败/非 JSON 返回 nil/字符串) ----
+(define (http-post url body ctype)
+  (if HAVE_CURL
+      (proc-run "curl" (list "-sS" "-L" "-k" "--retry" "3" "--retry-delay" "1"
+                             "-A" UA "-H" (str "Content-Type: " ctype) "-d" body "-o" FETCH_TMP url))
+      -1)
+  (if (and (exists? FETCH_TMP) (> (file-size FETCH_TMP) 0))
+      (let ((s (read-file FETCH_TMP))) (if (json-body? s) (json-parse s) s))
+      nil))
+(define (http-get-auth url token)
+  (if HAVE_CURL
+      (proc-run "curl" (list "-sS" "-L" "-k" "-A" UA "-H" (str "Authorization: Bearer " token) "-o" FETCH_TMP url))
+      -1)
+  (if (and (exists? FETCH_TMP) (> (file-size FETCH_TMP) 0))
+      (let ((s (read-file FETCH_TMP))) (if (json-body? s) (json-parse s) nil))
+      nil))
+(define (jget obj key) (if (null? obj) nil (json-get obj key)))
+;; json 取值统一成字符串: key 缺失时(json-get 可能返回 nil 或 "")一律给 ""
+;; 判定「字段缺失」要用 (equal? v "") 而不是 (null? v), 否则缺字段会被误当成有值。
+(define (jstr obj key)
+  (let ((v (jget obj key)))
+    (if (null? v) "" v)))
+
+;; ---- 微软登录 (OAuth 设备码流) ----
+(define (ms-xbl ms-token)
+  (define body (str "{\"Properties\":{\"AuthMethod\":\"RPS\",\"SiteName\":\"user.auth.xboxlive.com\",\"RpsTicket\":\"d=" ms-token "\"},\"RelyingParty\":\"http://auth.xboxlive.com\",\"TokenType\":\"JWT\"}"))
+  (http-post "https://user.auth.xboxlive.com/user/authenticate" body "application/json"))
+(define (ms-xsts xbl-token)
+  (define body (str "{\"Properties\":{\"SandboxId\":\"RETAIL\",\"UserTokens\":[\"" xbl-token "\"]},\"RelyingParty\":\"rp://api.minecraftservices.com/\",\"TokenType\":\"JWT\"}"))
+  (http-post "https://xsts.auth.xboxlive.com/xsts/authorize" body "application/json"))
+(define (ms-chain ms-tok ms-ref)
+  (define xbl (ms-xbl ms-tok))
+  (if (null? xbl) (begin (write-auth-status "error|Xbox 认证失败(网络/区域限制)") nil)
+    (let* ((xbl-tok (jstr xbl "Token"))
+           (xsts (ms-xsts xbl-tok))
+           (xsts-tok (if (null? xsts) "" (jstr xsts "Token")))
+           (xui-vec (if (null? xsts) nil (jget (jget xsts "DisplayClaims") "xui")))
+           (uhs (if (or (null? xui-vec) (null? (get xui-vec 0))) "" (jstr (get xui-vec 0) "uhs"))))
+      (if (or (equal? xsts-tok "") (equal? uhs ""))
+          (begin (write-auth-status "error|无法解析 XSTS 响应") nil)
+            (let* ((id-token (str "XBL3.0 x=" uhs ";t=" xsts-tok))
+               (mc (http-post "https://api.minecraftservices.com/authentication/login_with_xbox"
+                              (str "{\"identityToken\":\"" id-token "\"}") "application/json"))
+               (mc-tok (jstr mc "access_token")))
+          (if (equal? mc-tok "")
+              (begin (write-auth-status "error|Minecraft 服务登录失败(区域/网络)") nil)
+            (let* ((profile (http-get-auth "https://api.minecraftservices.com/minecraft/profile" mc-tok))
+                   (pname (jstr profile "name"))
+                   (puuid (jstr profile "id")))
+              (if (or (equal? pname "") (equal? puuid ""))
+                  (begin (write-auth-status "error|未获取到 MC 档案(该微软账号可能未购买游戏)") nil)
+                (let ((acct (list "microsoft" pname puuid mc-tok
+                                  (if (null? ms-ref) "" ms-ref)
+                                  (if (null? uhs) "" uhs) "0")))
+                  (upsert-account acct)
+                  (write-auth-status (str "ok|" pname "|" puuid))
+                      (say (str "  ✓ 微软登录成功: " pname "  uuid=" puuid))
+                      acct)))))))))
+(define (ms-finish msresp)
+  (define ms-tok (jstr msresp "access_token"))
+  (define ms-ref (jstr msresp "refresh_token"))
+  (if (equal? ms-tok "") (begin (write-auth-status "error|微软令牌缺失") nil)
+    (ms-chain ms-tok ms-ref)))
+(define (ms-login-flow)
+  (say "=== 微软登录 (设备码流) ===")
+  (define dc (http-post (str "https://login.microsoftonline.com/" MS_TENANT "/oauth2/v2.0/devicecode")
+                        (str "client_id=" MS_CLIENT_ID "&scope=" MS_SCOPE) "application/x-www-form-urlencoded"))
+  (if (string? dc)
+      (begin (write-auth-status "error|Microsoft 返回非 JSON(可能被网络拦截或证书问题)")
+             (say "  ✘ devicecode 响应不是 JSON") 0)
+    (if (null? dc)
+      (begin (write-auth-status "error|无法连接 Microsoft 登录服务(网络/证书)") (say "  ✘ devicecode 请求失败") 0)
+    (begin
+      (define user-code (jstr dc "user_code"))
+      (define veri-uri (jstr dc "verification_uri"))
+      (define dev-code (jstr dc "device_code"))
+      (if (or (equal? (jstr dc "user_code") "") (equal? (jstr dc "verification_uri") "") (equal? (jstr dc "device_code") ""))
+          (let* ((ed0 (jget dc "error_description"))
+                 (ed1 (jget dc "error"))
+                 (ed (if (null? ed0) (if (null? ed1) "Microsoft 返回异常" ed1) ed0)))
+            (if (equal? ed1 "unauthorized_client")
+                (begin
+                  (write-auth-status "error|微软 client_id 无效：请填写你自己注册的 Azure 应用 client_id")
+                  (say "  ✘ client_id 无效 (unauthorized_client)")
+                  (say "     请到「账户登录」页填写你自己注册的 Azure Application (client) ID"))
+                (begin
+                  (write-auth-status (str "error|" ed))
+                  (say (str "  ✘ " ed))))
+            0)
+        (begin
+          (say (str "  请在浏览器打开: " veri-uri))
+          (say (str "  输入代码: " user-code))
+          (write-auth-status (str "pending|" user-code "|" veri-uri))
+          (proc-run "cmd" (list "/c" "start" "" (str "\"" veri-uri "\"")))
+          (define got nil) (define tries 0)
+          (while (and (null? got) (< tries 60))
+            (begin
+              (set! tries (+ tries 1))
+              (sleep 5000)
+              (set! got (http-post (str "https://login.microsoftonline.com/" MS_TENANT "/oauth2/v2.0/token")
+                                   (str "grant_type=urn:ietf:params:oauth:grant-type:device_code&client_id=" MS_CLIENT_ID "&device_code=" dev-code) "application/x-www-form-urlencoded"))
+              (if (and (not (null? got)) (null? (jget got "error"))) 0 (set! got nil))))
+          (if (null? got)
+              (begin (write-auth-status "error|登录超时或被取消(请在浏览器完成登录)") (say "  ✘ 轮询超时") 0)
+              (ms-finish got))))))))
+
+;; ---- LittleSkin 登录 (Yggdrasil 外置登录) ----
+(define (littleskin-login-flow)
+  (say "=== LittleSkin 登录 (外置登录) ===")
+  (if (not (exists? LS_CRED_FILE))
+      (begin (write-auth-status "error|未收到账号密码(请先在界面输入)") (say "  ✘ 缺少凭据文件") 0)
+    (begin
+      (define cred (str-split (str-replace (read-file LS_CRED_FILE) "\r" "") "\t"))
+      (delete LS_CRED_FILE)
+      (if (< (length cred) 2)
+          (begin (write-auth-status "error|凭据格式错误") 0)
+        (begin
+          (define u (get cred 0)) (define p (get cred 1))
+          ;; LittleSkin 现在要求 agent 对象, 缺失会返回 400 IllegalArgumentException
+          (define body (str "{\"username\":\"" u "\",\"password\":\"" p
+                            "\",\"agent\":{\"name\":\"Minecraft\",\"version\":1}}"))
+          (define resp (http-post (str LS_AUTH "/authenticate") body "application/json"))
+          (if (null? resp)
+              (begin (write-auth-status "error|LittleSkin 连接失败(网络/证书)") (say "  ✘ 连接失败") 0)
+            (if (string? resp)
+                (begin (write-auth-status (str "error|" (short resp))) (say (str "  ✘ " (short resp))) 0)
+              (begin
+                (define token (jstr resp "accessToken"))
+                (define sp (jstr resp "selectedProfile"))
+                (if (or (equal? token "") (equal? sp ""))
+                    (begin
+                      (define em (jstr resp "errorMessage"))
+                      (if (equal? em "") (set! em (jstr resp "error")) 0)
+                      (if (equal? em "") (set! em "认证失败") 0)
+                      (write-auth-status (str "error|LittleSkin: " em))
+                      (say (str "  ✘ " em)) 0)
+                  (begin
+                    (define name (jstr sp "name"))
+                    (define uuid (jstr sp "id"))
+                    (define acct (list "littleskin" name uuid token LS_AUTH LS_SESSION "0"))
+                    (upsert-account acct)
+                    (write-auth-status (str "ok|" name "|" uuid))
+                    (say (str "  ✓ LittleSkin 登录成功: " name "  uuid=" uuid))
+                    acct))))))))))
+
+;; ============================================================
 ;;  主流程
 ;; ============================================================
 (define (run)
@@ -569,10 +884,12 @@
   (define full-args nil)
   (define failed-libs 0)
   (define ni 0)
+  (define acct nil)
+  (define AUTH_TYPE "offline")
 
   ;; 1) 版本清单
-  (say "» 拉取 Mojang 版本清单...")
-  (set! manifest (json-parse (http-get PISTON_MANIFEST UA)))
+  (say (str "» 拉取版本清单(" (if USE_MIRROR "BMCLAPI 镜像优先" "官方源") ")..."))
+  (set! manifest (fetch-json PISTON_MANIFEST))
   (if (null? manifest) (set! ok false))
   (if ok (begin
     (set! versions (json-get manifest "versions"))
@@ -584,7 +901,7 @@
   ;; 2) 版本元数据
   (if ok (begin
     (say (str "» 拉取版本元数据: " (short vmeta-url)))
-    (set! vmeta (json-parse (http-get vmeta-url UA)))
+    (set! vmeta (fetch-json vmeta-url))
     (if (null? vmeta) (set! ok false))))
   (if ok (begin
     (if (not (null? (json-get vmeta "mainClass"))) (set! MAIN_CLASS (json-get vmeta "mainClass")) 0)
@@ -627,17 +944,21 @@
     (set! idx-local (str ASSETS_DIR SEP "indexes" SEP asset-idx-id ".json"))
     (if dry?
         (begin
-          (set! idx-body (http-get asset-idx-url UA))
-          (set! asset-objs (json-parse idx-body))
+          (set! asset-objs (fetch-json asset-idx-url))
           (if (null? asset-objs)
               (say "  (资源索引解析失败, 跳过统计)")
               (set! asset-count (length (json-get asset-objs "objects")))))
         (begin
-          (download-verify asset-idx-url idx-local asset-idx-sha)
-          (set! asset-objs (json-parse (read-file idx-local)))
-          (if (null? asset-objs)
-              (say "  ✘ 资源索引解析失败")
-              (set! asset-count (length (json-get asset-objs "objects"))))))
+          ;; 走 curl 拉取(镜像失败自动回退官方), 并先校验像不像 JSON 再解析,
+          ;; 避免「镜像返回警告页 / TLS 握手失败」时读到空文件导致 json-parse 崩溃。
+          (let ((raw (fetch-str (mirror asset-idx-url))))
+            (if (not (json-body? raw)) (set! raw (fetch-str asset-idx-url)) 0)
+            (if (json-body? raw)
+                (begin
+                  (set! asset-objs (json-parse raw))
+                  (write-file idx-local raw)
+                  (set! asset-count (length (json-get asset-objs "objects"))))
+                (begin (set! asset-objs nil) (say "  ✘ 资源索引拉取失败"))))))
     (if (not (null? asset-objs))
         (say (str "  资源对象: " asset-count " 个")))))
 
@@ -672,8 +993,18 @@
 
   ;; 6) 组装启动命令
   (if ok (begin
-    (set! UUID (make-uuid))
-    (set! TOKEN (make-token))
+    ;; 账号: 若当前为在线账户(微软/LittleSkin)则用之, 否则随机(离线)
+    (set! acct (get-current-account))
+    (if (and (not (null? acct)) (or (equal? (get acct 0) "microsoft") (equal? (get acct 0) "littleskin")))
+        (begin
+          (set! USERNAME (get acct 1))
+          (set! UUID (get acct 2))
+          (set! TOKEN (get acct 3))
+          (set! AUTH_TYPE (get acct 0))
+          (if (equal? AUTH_TYPE "microsoft")
+              (begin (set! CLIENT_ID MS_CLIENT_ID) (set! XUID (get acct 5)) (set! USER_TYPE "msa"))
+              0))
+        (begin (set! UUID (make-uuid)) (set! TOKEN (make-token)) (set! AUTH_TYPE "offline") (set! USER_TYPE "mojang")))
     (set! ASSET_ID asset-idx-id)
     (set! args-obj (json-get vmeta "arguments"))
     (if (null? args-obj)
@@ -685,12 +1016,16 @@
           (set! game-args (list "--username" USERNAME "--version" TARGET_VERSION
                                 "--gameDir" INSTANCE_DIR "--assetsDir" ASSETS_DIR
                                 "--assetIndex" ASSET_ID "--uuid" UUID
-                                "--accessToken" TOKEN "--userType" "mojang"
+                                "--accessToken" TOKEN "--userType" USER_TYPE
                                 "--versionType" "release"))
           (set! full-args (append jvm-args (cons MAIN_CLASS game-args))))
         (begin
           (set! jvm-args (resolve-section (json-get vmeta "arguments" "jvm")))
           (set! game-args (resolve-section (json-get vmeta "arguments" "game")))
+          ;; LittleSkin 外置登录: 追加自定义 auth/session 服务器
+          (if (equal? AUTH_TYPE "littleskin")
+              (set! game-args (append game-args (list "--authServer" (get acct 4) "--sessionServer" (get acct 5))))
+              0)
           (set! full-args (append jvm-args (cons MAIN_CLASS game-args)))))
     (say "")
     (say "» 启动命令:")
@@ -707,5 +1042,14 @@
 
   (if (not ok) (say "✘ 流程因错误中止。") 0))
 
-;; 启动
-(run)
+;; 启动 / 登录分发
+;; 程序启动即预热账户缓存(只读一次, 后续复用)
+(set! ACCOUNTS_CACHE (load-accounts))
+
+(define (auth-dispatch)
+  (if (not (null? MODE))
+      (if (equal? MODE "auth-ms") (ms-login-flow)
+        (if (equal? MODE "auth-littleskin") (littleskin-login-flow)
+          (run)))
+      (run)))
+(auth-dispatch)
