@@ -449,7 +449,7 @@
          "&& set NUOMI_GAME_DIR=" GAME_DIR
          "&& set NUOMI_PROGRESS_FILE=" PROG
         "&& cd /d " LAUNCH_DIR
-        "&& start /min " LAUNCH_DIR "\\nuomi.exe launcher.nuomi"))))
+        "&& start /min " LAUNCH_DIR "\\nuomiw.exe launcher.nuomi"))))
 
 ;; ---------- 触发登录流程(独立进程) ----------
 ;; mode: "auth-ms" | "auth-littleskin" | "auth-refresh"
@@ -461,7 +461,7 @@
   (proc-run "cmd" (list "/c"
     (str "set NUOMI_MODE=" mode
         "&& cd /d " LAUNCH_DIR
-        "&& start /min " LAUNCH_DIR "\\nuomi.exe launcher.nuomi"))))
+        "&& start /min " LAUNCH_DIR "\\nuomiw.exe launcher.nuomi"))))
 
 ;; LittleSkin 登录: 先把账号密码写到临时凭据文件, 再让 launcher 子进程读取并删除
 (define (login-littleskin)

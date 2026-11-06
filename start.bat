@@ -17,11 +17,15 @@ set "MODE=%1"
 if "%MODE%"=="" set "MODE=gui"
 
 if /I "%MODE%"=="gui" (
-  echo [NuomiLauncher] opening GUI...
-  "%~dp0nuomi.exe" "%~dp0gui.nuomi"
+  rem Use nuomiw.exe (GUI subsystem) so no console window is attached.
+  rem For a truly black-box-free double-click, use NuomiMC-GUI.vbs instead.
+  if exist "%~dp0nuomiw.exe" (
+    "%~dp0nuomiw.exe" "%~dp0gui.nuomi"
+  ) else (
+    echo [NuomiLauncher] nuomiw.exe not found, falling back to nuomi.exe
+    "%~dp0nuomi.exe" "%~dp0gui.nuomi"
+  )
   set "RC=%ERRORLEVEL%"
-  echo.
-  echo [NuomiLauncher] GUI exited with exit code %RC%
   endlocal
   exit /b %RC%
 )

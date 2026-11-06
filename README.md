@@ -7,19 +7,35 @@
 NuomiLauncher/
 ├── launcher.nuomi     ← 启动器本体（全部逻辑都在这一个文件里）
 ├── gui.nuomi          ← 图形界面（自绘窗口：启动/下载/账户登录三页）
-├── nuomi.exe          ← 糯米解释器（含本项目给 Nuomi 加的原生函数）
-├── start.bat          ← 双击运行（纯英文 + GBK + CRLF）
+├── nuomi.exe          ← 糯米解释器 · CONSOLE 版（命令行模式要看日志时用）
+├── nuomiw.exe         ← 糯米解释器 · GUI 版（同一份二进制，双击无黑框）
+├── nuomiMC-GUI.vbs    ← ★ 推荐：双击它开图形界面，全程零 cmd 黑框
+├── start.bat          ← 命令行入口（纯英文 + GBK + CRLF）
 └── README.md
 ```
+
+> **两个解释器有什么区别？** 跟 Python 的 `python.exe` / `pythonw.exe` 一个套路：
+> `nuomiw.exe` 只是把 `nuomi.exe` 的 PE 头子系统字段从 CONSOLE(3) 改成 WINDOWS GUI(2)，
+> 代码完全一样（只差 4 字节）。GUI 子系统程序启动时 Windows 不会给它分配控制台窗口，
+> 所以双击不弹黑框；而 CLI 模式仍需 `nuomi.exe` 才能看到 `say` / `println` 的日志。
+> 生成脚本在 Nuomi 本体的 `tools/make-windowed.py`。
 
 ---
 
 ## 一、快速开始
 
-双击 `start.bat`，或者在命令行里：
+### 开图形界面（推荐，无黑框）
+
+**双击 `nuomiMC-GUI.vbs`** 即可，全程没有 cmd 黑框：VBS 由 `wscript.exe`（GUI 宿主）
+执行，它再拉起 `nuomiw.exe`（GUI 子系统），两者都不需要控制台窗口。
+
+> 直接双击 `start.bat` 或 `nuomi.exe` 会看到黑框，那是 Windows 给批处理/控制台程序
+> 分配的控制台，**不是报错**。想留着看日志就用它们，不想看就用 VBS。
+
+### 命令行模式（需要看下载/登录日志）
 
 ```bat
-start.bat gui        :: 打开图形界面（推荐：鼠标点按钮 + 输入玩家名）
+start.bat gui        :: 打开图形界面（从批处理进，会带一个 cmd 窗口）
 start.bat dry        :: 只规划，打印 java 启动命令，不下载不启动
 start.bat download   :: 下载全部资源（client.jar / 依赖库 / 原生库 / 资源包）
 start.bat launch     :: 下载全部资源并启动 Minecraft
@@ -37,11 +53,16 @@ nuomi.exe gui.nuomi
 > 命令行里直接打 `nuomi MC-gui` 也能开图形界面（其它模式：`nuomi MC-start` /
 > `nuomi MC-download` / `nuomi MC-dry`）。
 
+> 💡 **为什么子进程也不弹黑框了**：`proc.c` 的 `proc-spawn` 在创建 curl / java /
+> powershell / cmd 子进程时统一加了 `CREATE_NO_WINDOW`，输出仍走匿名管道读回。
+> 所以即使用 `start.bat download`，下载时也不会一个文件闪一个黑框。
+
 ---
 
 ## 一-A、图形界面（GUI）
 
-不想敲命令的话，用 GUI 最省事：双击 `start.bat` 选 `gui`，或命令行 `nuomi MC-gui`。
+不想敲命令的话，用 GUI 最省事：**双击 `nuomiMC-GUI.vbs`**（无黑框），
+或命令行 `start.bat gui` / `nuomi MC-gui`（这两种会带 cmd 窗口）。
 
 界面长这样（自绘窗口，无第三方库）：
 
@@ -55,8 +76,9 @@ nuomi.exe gui.nuomi
 
 > 按钮采用**二次确认**：点一下变亮显示「确认启动?」，再点一次才真正执行；点别处会取消，防止误触下载。
 
-> 💡 后端其实是 `launcher.nuomi`（CLI）。GUI 用 `cmd /c start /min` 异步拉起它，
-> 进度写进 `%USERPROFILE%/.nuomi-mc/gui_progress.txt`，GUI 轮询显示——
+> 💡 后端其实是 `launcher.nuomi`（CLI）。GUI 用 `cmd /c start /min` 异步拉起
+> **`nuomiw.exe`**（GUI 版，后台不再弹黑框），进度写进
+> `%USERPROFILE%/.nuomi-mc/gui_progress.txt`，GUI 轮询显示——
 > 所以主窗口的消息循环不会卡住。麻烦的是 Java 仍要在 PATH 里（见下方提醒）。
 
 > ⚠️ **需要自备 Java**：`java` 要在 PATH 里（装 JRE/JDK 都行）。
